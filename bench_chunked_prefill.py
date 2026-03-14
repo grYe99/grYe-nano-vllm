@@ -9,6 +9,8 @@ bench_chunked_prefill.py - Chunked Prefill Benchmark
 """
 import argparse
 import time
+from nanovllm import LLM, SamplingParams
+from nanovllm.utils.metrics import MetricsCollector
 
 MODEL = "./assets/Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
 
@@ -18,9 +20,7 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=0,
                         help="prefill_chunk_size (0=disabled)")
     parser.add_argument("--max-tokens", type=int, default=64)
-    args = parser.parse_args()
-
-    from nanovllm import LLM, SamplingParams
+    args = parser.parse_args()  
 
     # 短 prompt：会快速完成 prefill，立刻进入 decode，制造"在途 decode 请求"
     short_prompts = [
@@ -50,7 +50,8 @@ def main():
     print(f"预期：chunk_size>0 时 tqdm 同时显示 Prefill 和 Decode 非零")
     print()
 
-    llm = LLM(args.model, prefill_chunk_size=args.chunk_size, enforce_eager=True)
+    metrics = MetricsCollector()
+    llm = LLM(args.model, prefill_chunk_size=args.chunk_size, enforce_eager=True, metrics=metrics)
 
     t_start = time.perf_counter()
     outputs = llm.generate(prompts, sp, use_tqdm=True)
