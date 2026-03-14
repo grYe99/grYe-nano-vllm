@@ -9,7 +9,7 @@ class Block:
 
     def __init__(self, block_id):
         self.block_id = block_id
-        self.ref_count = 0
+        self.ref_count = 0  # 被几个sequence使用
         self.hash = -1
         self.token_ids = []
 
@@ -36,7 +36,7 @@ class BlockManager:
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
         if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
+            h.update(prefix.to_bytes(8, "little")) #考虑前缀的hash
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 

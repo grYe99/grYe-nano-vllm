@@ -110,9 +110,9 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        used = total - free # 显卡正在使用的显存
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"] # warmup得到
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"] #当前pytorch进程正在使用的显存（对比used）
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
@@ -145,7 +145,7 @@ class ModelRunner:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
             # 位置编码，标明token在seq中的位置（tokens并行计算，不知道位置）
-            # attention层会做旋转计算，属于模型内的操作，推理框架不需要关注
+            # attention层会做旋转编码RoPE，属于模型内的操作，推理框架不需要关注
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen

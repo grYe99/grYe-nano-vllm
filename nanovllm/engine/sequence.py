@@ -10,7 +10,7 @@ class SequenceStatus(Enum):
     RUNNING = auto()
     FINISHED = auto()
 
-
+# 管理一个prompt的token_ids，包括如何划分block、决定怎么生成token（设置采样参数）、追加token、进度状态等
 # Sequence里的是根据block_size（每block的token数量）划分的虚拟block，真正操作block的在在block_manager
 class Sequence:
     block_size = 256
