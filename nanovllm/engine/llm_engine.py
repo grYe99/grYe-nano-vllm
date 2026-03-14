@@ -10,11 +10,13 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.utils.metrics import MetricsCollector
 
 
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        self.metrics = kwargs.pop("metrics", None)
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
@@ -31,6 +33,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.scheduler.metrics = self.metrics
         atexit.register(self.exit)
 
     def exit(self):
@@ -43,11 +46,16 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        if self.metrics:
+            self.metrics.on_request_added(seq)
         self.scheduler.add(seq)
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if is_prefill and self.metrics:
+            for seq in seqs:
+                self.metrics.on_prefill_done(seq)
         self.scheduler.postprocess(seqs, token_ids) #追加生成的token
         #判断生成的token是否都finish（completion_token_ids截断prompt）
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
@@ -71,6 +79,8 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        if self.metrics:
+            self.metrics.on_generate_start()
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
@@ -91,4 +101,7 @@ class LLMEngine:
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()
+        if self.metrics:
+            self.metrics.on_generate_end()
+            self.metrics.print_summary()
         return outputs

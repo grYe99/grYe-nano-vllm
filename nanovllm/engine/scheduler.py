@@ -14,6 +14,7 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.metrics = None  # set by LLMEngine after init
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -62,11 +63,17 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
+        if self.metrics:
+            self.metrics.on_preempt(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
+            if self.metrics:
+                self.metrics.on_token_generated(seq)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+                if self.metrics:
+                    self.metrics.on_request_finished(seq)
