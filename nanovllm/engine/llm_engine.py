@@ -51,16 +51,69 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        if is_prefill and self.metrics:
-            for seq in seqs:
-                self.metrics.on_prefill_done(seq)
-        self.scheduler.postprocess(seqs, token_ids) #追加生成的token
-        #判断生成的token是否都finish（completion_token_ids截断prompt）
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens
+        prefill_seqs, decode_seqs = self.scheduler.schedule()
+
+        if prefill_seqs and not decode_seqs:
+            if self.scheduler.prefill_chunk_size > 0:
+                # chunked mode: must use run_mixed (even with empty decode list) so that
+                # prepare_chunked_prefill correctly handles current_chunk_len / num_computed_tokens
+                token_ids = self.model_runner.call("run_mixed", prefill_seqs, decode_seqs)
+                outputs = []
+                for i, seq in enumerate(prefill_seqs):
+                    seq.num_computed_tokens += seq.current_chunk_len
+                    if seq.is_prefill_done:
+                        if self.metrics:
+                            self.metrics.on_prefill_done(seq)
+                        self.scheduler.postprocess([seq], [token_ids[i]])
+                        if seq.is_finished:
+                            outputs.append((seq.seq_id, seq.completion_token_ids))
+                num_tokens = sum(seq.current_chunk_len for seq in prefill_seqs)
+                return outputs, num_tokens
+            else:
+                # non-chunked: original whole-prefill path
+                token_ids = self.model_runner.call("run", prefill_seqs, True)
+                if self.metrics:
+                    for seq in prefill_seqs:
+                        self.metrics.on_prefill_done(seq)
+                self.scheduler.postprocess(prefill_seqs, token_ids)
+                outputs = [(seq.seq_id, seq.completion_token_ids) for seq in prefill_seqs if seq.is_finished]
+                num_tokens = sum(len(seq) - seq.num_cached_tokens for seq in prefill_seqs)
+                return outputs, num_tokens
+
+        elif not prefill_seqs and decode_seqs:
+            # 纯 decode
+            token_ids = self.model_runner.call("run", decode_seqs, False)
+            self.scheduler.postprocess(decode_seqs, token_ids)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in decode_seqs if seq.is_finished]
+            num_tokens = -len(decode_seqs)
+            return outputs, num_tokens
+
+        else:
+            # 混合批次（chunked prefill chunk + decode）
+            token_ids = self.model_runner.call("run_mixed", prefill_seqs, decode_seqs)
+            outputs = []
+
+            # 处理 prefill seqs：更新 num_computed_tokens，只在最后一个 chunk 时 postprocess
+            for i, seq in enumerate(prefill_seqs):
+                seq.num_computed_tokens += seq.current_chunk_len
+                if seq.is_prefill_done:
+                    # 最后一个 chunk 完成，token_ids[i] 是该 seq 的第一个 completion token
+                    if self.metrics:
+                        self.metrics.on_prefill_done(seq)
+                    self.scheduler.postprocess([seq], [token_ids[i]])
+                    if seq.is_finished:
+                        outputs.append((seq.seq_id, seq.completion_token_ids))
+
+            # 处理 decode seqs
+            decode_token_ids = token_ids[len(prefill_seqs):]
+            self.scheduler.postprocess(decode_seqs, decode_token_ids)
+            for seq in decode_seqs:
+                if seq.is_finished:
+                    outputs.append((seq.seq_id, seq.completion_token_ids))
+
+            # 混合步骤：num_tokens 记为 -len(decode_seqs)（主要贡献是 decode throughput）
+            num_tokens = -len(decode_seqs)
+            return outputs, num_tokens
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -87,8 +140,9 @@ class LLMEngine:
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
+                elif num_tokens < 0:
                     decode_throughput = -num_tokens / (perf_counter() - t)
+                # num_tokens == 0: 中间 chunk 步，不更新吞吐量
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",

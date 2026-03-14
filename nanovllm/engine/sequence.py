@@ -25,6 +25,8 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.block_table = []
+        self.num_computed_tokens: int = 0  # 通过 model forward 的 token 数（不含 prefix cache）
+        self.current_chunk_len: int = 0    # 本 step 处理的 chunk 长度（由调度器写入，需序列化供 TP worker 使用）
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -52,6 +54,15 @@ class Sequence:
         return self.token_ids[self.num_prompt_tokens:]
 
     @property
+    def num_tokens_to_prefill(self) -> int:
+        """还需要 feed 给模型的 prompt token 数"""
+        return max(0, self.num_prompt_tokens - self.num_cached_tokens - self.num_computed_tokens)
+
+    @property
+    def is_prefill_done(self) -> bool:
+        return self.num_tokens_to_prefill == 0
+
+    @property
     def num_cached_blocks(self):
         return self.num_cached_tokens // self.block_size
 
@@ -74,11 +85,13 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+                self.num_computed_tokens, self.current_chunk_len, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+         self.num_computed_tokens, self.current_chunk_len, self.block_table) = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

@@ -12,6 +12,9 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    prefill_chunk_size: int = 0
+    # 0 = 禁用（保持原始行为）
+    # >0 = 每 step prefill 的最大 token 数
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -24,3 +27,4 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        assert self.prefill_chunk_size >= 0

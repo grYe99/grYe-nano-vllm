@@ -190,6 +190,84 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    def prepare_chunked_prefill(self, prefill_seqs: list[Sequence], decode_seqs: list[Sequence]):
+        """
+        构建混合批次输入（chunked prefill chunk + decode tokens）。
+        布局：prefill tokens 在前，decode tokens 在后。
+        使用 is_prefill=True + block_tables，走 flash_attn_varlen_func with paged KV。
+        """
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+
+        # --- prefill chunk seqs ---
+        for seq in prefill_seqs:
+            chunk_start = seq.num_cached_tokens + seq.num_computed_tokens
+            chunk_len = seq.current_chunk_len
+            chunk_end = chunk_start + chunk_len
+
+            input_ids.extend(seq[chunk_start:chunk_end])
+            positions.extend(range(chunk_start, chunk_end))
+
+            seqlen_q = chunk_len
+            seqlen_k = chunk_end  # cached + computed + current chunk
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+
+            # slot mapping: chunk 内每个 token 写入 KV cache 的物理 slot
+            for token_pos in range(chunk_start, chunk_end):
+                block_idx = token_pos // self.block_size
+                block_offset = token_pos % self.block_size
+                slot_mapping.append(seq.block_table[block_idx] * self.block_size + block_offset)
+
+        # --- decode seqs ---
+        for seq in decode_seqs:
+            input_ids.append(seq.last_token)
+            positions.append(len(seq) - 1)
+
+            seqlen_q = 1
+            seqlen_k = len(seq)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(1, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+
+            # decode token 的 slot（同 prepare_decode）
+            slot_mapping.append(
+                seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+            )
+
+        # 混合批次始终需要 block_tables（prefill chunk 也要读取前面的 KV）
+        all_seqs = prefill_seqs + decode_seqs
+        block_tables = self.prepare_block_tables(all_seqs)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        # is_prefill=True：走 flash_attn_varlen_func + paged KV（attention.py:65-70）
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                    slot_mapping, None, block_tables)
+        return input_ids, positions
+
+    def run_mixed(self, prefill_seqs: list[Sequence], decode_seqs: list[Sequence]) -> list[int]:
+        """处理混合批次（chunked prefill + decode）。始终使用 eager 模式（不用 CUDAGraph）。"""
+        all_seqs = prefill_seqs + decode_seqs
+        input_ids, positions = self.prepare_chunked_prefill(prefill_seqs, decode_seqs)
+        temperatures = self.prepare_sample(all_seqs) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, is_prefill=True)
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        reset_context()
+        return token_ids
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
         for seq in seqs:
