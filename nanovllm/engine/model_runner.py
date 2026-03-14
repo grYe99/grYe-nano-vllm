@@ -23,26 +23,34 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if self.world_size > 1:
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        else:
+            import tempfile, os as _os
+            store = dist.FileStore(_os.path.join(tempfile.gettempdir(), "nanovllm_dist_store"), 1)
+            dist.init_process_group("gloo", store=store, rank=0, world_size=1)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
+        # vllm是动态选择要加载模型结构类型的
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.warmup_model()
+        self.warmup_model() # 探测模型在最大负载下的显存峰值emory_stats()["allocated_bytes.all.peak"]，为后续 KV cache 分配计算可用空间
         self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
+        if not self.enforce_eager: #即时模式不捕获cuda graph
+            self.capture_cudagraph() #类比于图形的command buffer，一次提交cpu指令减少调度开销（CPU指令跟不上GPU执行、通信开销等）
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
+        if self.world_size > 1 and dist.is_initialized():
             if rank == 0:
+                # rank=0的是主进程，创建共享内存
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
+                dist.barrier() # 分布式同步，使用nccl基于网络通信来同步（纯GPU优化），gloo支持CPU [26-31行]
             else:
+                # worker进程，会和共享内存进行通信
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
@@ -56,7 +64,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -135,6 +144,8 @@ class ModelRunner:
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
+            # 位置编码，标明token在seq中的位置（tokens并行计算，不知道位置）
+            # attention层会做旋转计算，属于模型内的操作，推理框架不需要关注
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
@@ -189,8 +200,9 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return self.model.compute_logits(self.model(input_ids, positions)) # forward
         else:
+            # cuda graph逻辑
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -207,8 +219,10 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        # 只有主进程才需要temperatures，最终forward结果在主进程处理
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
+        # sampler用的softmax
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

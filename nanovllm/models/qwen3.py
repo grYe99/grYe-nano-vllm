@@ -11,6 +11,23 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
+def _get_rope_theta(config) -> float:
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is not None:
+        return rope_theta
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        return rope_scaling.get("rope_theta", 10000.0)
+    return 10000.0
+
+
+def _get_rope_scaling(config):
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict) and rope_scaling.get("rope_type") == "default":
+        return None
+    return rope_scaling
+
+
 class Qwen3Attention(nn.Module):
 
     def __init__(
@@ -131,8 +148,10 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            # rope_theta=getattr(config, "rope_theta", 1000000),
+            # rope_scaling=getattr(config, "rope_scaling", None),
+            rope_theta=_get_rope_theta(config),
+            rope_scaling=_get_rope_scaling(config),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

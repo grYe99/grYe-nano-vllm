@@ -32,6 +32,7 @@ class Scheduler:
                 break
             num_seqs += 1
             self.block_manager.allocate(seq)
+            # num_cached_tokens是prefix cache命中的token数量
             num_batched_tokens += len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
@@ -42,16 +43,16 @@ class Scheduler:
 
         # decode
         while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            seq = self.running.popleft() # 队列头
+            while not self.block_manager.can_append(seq): #不能添加，没显存了
                 if self.running:
-                    self.preempt(self.running.pop())
+                    self.preempt(self.running.pop()) # 抢占，驱逐队列尾的prompt到waiting的front，并释放block
                 else:
-                    self.preempt(seq)
+                    self.preempt(seq) #抢占自己，让自己回到waiting的front，并释放block
                     break
             else:
                 num_seqs += 1
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq) # append后，当前block写满，记录hash；上个block写满，新建block
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))

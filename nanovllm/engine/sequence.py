@@ -11,6 +11,7 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
+# Sequence里的是根据block_size（每block的token数量）划分的虚拟block，真正操作block的在在block_manager
 class Sequence:
     block_size = 256
     counter = count()
@@ -64,6 +65,7 @@ class Sequence:
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
+        # 返回block内的token_ids
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
