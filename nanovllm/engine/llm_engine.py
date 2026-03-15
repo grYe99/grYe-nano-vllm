@@ -3,6 +3,7 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -11,6 +12,20 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.utils.metrics import MetricsCollector
+
+# NVTX range helpers — zero-overhead when nvtx is unavailable
+try:
+    from torch.cuda import nvtx as _nvtx
+    def _nvtx_range(name: str):
+        class _R:
+            def __enter__(self): _nvtx.range_push(name)
+            def __exit__(self, *_): _nvtx.range_pop()
+        return _R()
+except Exception:
+    class _nvtx_range:  # type: ignore
+        def __init__(self, name): pass
+        def __enter__(self): pass
+        def __exit__(self, *_): pass
 
 
 class LLMEngine:
@@ -37,6 +52,8 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, "model_runner"):
+            return
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -57,7 +74,8 @@ class LLMEngine:
             if self.scheduler.prefill_chunk_size > 0:
                 # chunked mode: must use run_mixed (even with empty decode list) so that
                 # prepare_chunked_prefill correctly handles current_chunk_len / num_computed_tokens
-                token_ids = self.model_runner.call("run_mixed", prefill_seqs, decode_seqs)
+                with _nvtx_range("prefill_chunk"):
+                    token_ids = self.model_runner.call("run_mixed", prefill_seqs, decode_seqs)
                 outputs = []
                 for i, seq in enumerate(prefill_seqs):
                     seq.num_computed_tokens += seq.current_chunk_len
@@ -71,7 +89,8 @@ class LLMEngine:
                 return outputs, num_tokens
             else:
                 # non-chunked: original whole-prefill path
-                token_ids = self.model_runner.call("run", prefill_seqs, True)
+                with _nvtx_range("prefill"):
+                    token_ids = self.model_runner.call("run", prefill_seqs, True)
                 if self.metrics:
                     for seq in prefill_seqs:
                         self.metrics.on_prefill_done(seq)
@@ -82,7 +101,8 @@ class LLMEngine:
 
         elif not prefill_seqs and decode_seqs:
             # 纯 decode
-            token_ids = self.model_runner.call("run", decode_seqs, False)
+            with _nvtx_range("decode"):
+                token_ids = self.model_runner.call("run", decode_seqs, False)
             self.scheduler.postprocess(decode_seqs, token_ids)
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in decode_seqs if seq.is_finished]
             num_tokens = -len(decode_seqs)
@@ -90,7 +110,8 @@ class LLMEngine:
 
         else:
             # 混合批次（chunked prefill chunk + decode）
-            token_ids = self.model_runner.call("run_mixed", prefill_seqs, decode_seqs)
+            with _nvtx_range("mixed_prefill_chunk_decode"):
+                token_ids = self.model_runner.call("run_mixed", prefill_seqs, decode_seqs)
             outputs = []
 
             # 处理 prefill seqs：更新 num_computed_tokens，只在最后一个 chunk 时 postprocess

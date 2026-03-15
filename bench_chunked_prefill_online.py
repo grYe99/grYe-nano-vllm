@@ -68,13 +68,15 @@ def run(model: str, chunk_size: int, max_tokens: int):
         # 注入时机：running 中存在已完成 prefill 的 seq（即有 seq 在 decode）
         # 且长 prompt 尚未注入
         if not long_injected:
-            if any(seq.is_prefill_done for seq in llm.scheduler.running):
+            # is_prefill_done 在非 chunked 模式下不可用（num_computed_tokens 从未更新）
+            # 改用 num_completion_tokens > 0：有 decode token 即说明已完成 prefill
+            if any(seq.num_completion_tokens > 0 for seq in llm.scheduler.running):
                 # 此时短 prompt 正在 decode，注入长 prompt 触发阻塞场景
                 for p in LONG_PROMPTS:
                     llm.add_request(p, sp_long)
                 long_injected = True
                 print(f"[注入长 prompt] 共 {len(llm.scheduler.running)} 个 seq 在 running，"
-                      f"{sum(1 for s in llm.scheduler.running if s.is_prefill_done)} 个在 decode")
+                      f"{sum(1 for s in llm.scheduler.running if s.num_completion_tokens > 0)} 个在 decode")
                 # 长 prompt 此时在 waiting 队列，下一个 step 调度器会将其与
                 # 正在 decode 的短 prompt 一起调度，从而触发 prefill-vs-decode 竞争
 
@@ -89,6 +91,9 @@ def run(model: str, chunk_size: int, max_tokens: int):
     print(f"\n完成请求数: {len(outputs)}")
     print(f"输出 token 总数: {total_tokens}")
     print()
+
+    # 显式清理：释放 GPU 资源和 dist process group，以便 --compare 模式创建第二个 LLM 实例
+    llm.exit()
 
     # 返回关键指标供对比
     s = metrics.summary()
