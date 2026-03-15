@@ -12,7 +12,9 @@ bench_chunked_prefill_online.py - Chunked Prefill Online Arrival Benchmark
   chunk-size=0  : itl_p99 远高于 itl_p50（长 prefill 阻塞 decode，出现毛刺）
   chunk-size=256: itl_p99 接近 itl_p50（decode 与 prefill 交替，无毛刺）
 """
+import gc
 import argparse
+import torch
 from nanovllm import LLM, SamplingParams
 from nanovllm.utils.metrics import MetricsCollector
 
@@ -93,7 +95,11 @@ def run(model: str, chunk_size: int, max_tokens: int):
     print()
 
     # 显式清理：释放 GPU 资源和 dist process group，以便 --compare 模式创建第二个 LLM 实例
+    # 必须 gc.collect() + empty_cache()：否则 PyTorch 缓存的 CUDA 内存未归还给驱动，
+    # 下一个 LLM 的 allocate_kv_cache() 用 mem_get_info() 看到的 free 接近 0，num_kvcache_blocks=0 → AssertionError
     llm.exit()
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # 返回关键指标供对比
     s = metrics.summary()
