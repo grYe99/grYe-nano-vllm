@@ -41,7 +41,7 @@ LONG_PROMPTS = [
 def run(model: str, chunk_size: int, max_tokens: int):
     print(f"\n{'='*50}")
     print(f"chunk_size={chunk_size}, max_tokens={max_tokens}")
-    print(f"短 prompt: {len(SHORT_PROMPTS)} 个，长 prompt: {len(LONG_PROMPTS)} 个 (~512 tokens)")
+    print(f"短 prompt: {len(SHORT_PROMPTS)} 个，长 prompt: {len(LONG_PROMPTS)} 个 (~1024 tokens)")
     print(f"场景: 短 prompt 先进入 decode，长 prompt 后注入")
     print(f"{'='*50}")
 
