@@ -13,7 +13,6 @@ bench_chunked_prefill_online.py - Chunked Prefill Online Arrival Benchmark
   chunk-size=256: itl_p99 接近 itl_p50（decode 与 prefill 交替，无毛刺）
 """
 import argparse
-from time import perf_counter
 from nanovllm import LLM, SamplingParams
 from nanovllm.utils.metrics import MetricsCollector
 
@@ -31,7 +30,7 @@ SHORT_PROMPTS = [
     "To solve this problem, we need to",
 ]
 
-# 长 prompt：~512 tokens（"hello " 约 1-2 token/word，512 次 ≈ 512 tokens）
+# 长 prompt：~1024 tokens（"hello " 每次约 2 tokens，512 次 ≈ 1024 tokens）
 # 在 chunk_size=256 时需要 2 步完成 prefill；chunk_size=0 时一步完成但耗时长
 LONG_PROMPTS = [
     "hello " * 512,
@@ -76,6 +75,8 @@ def run(model: str, chunk_size: int, max_tokens: int):
                 long_injected = True
                 print(f"[注入长 prompt] 共 {len(llm.scheduler.running)} 个 seq 在 running，"
                       f"{sum(1 for s in llm.scheduler.running if s.is_prefill_done)} 个在 decode")
+                # 长 prompt 此时在 waiting 队列，下一个 step 调度器会将其与
+                # 正在 decode 的短 prompt 一起调度，从而触发 prefill-vs-decode 竞争
 
     metrics.on_generate_end()
 
@@ -123,21 +124,21 @@ def main():
         print(f"{'指标':<20} {'chunk=0':>12} {'chunk=256':>12} {'改善':>10}")
         print("-"*60)
         r0, r256 = results[0], results[1]
-        itl_improve = (r0["itl_p99_ms"] - r256["itl_p99_ms"]) / r0["itl_p99_ms"] * 100
+        itl_improve = (r0["itl_p99_ms"] - r256["itl_p99_ms"]) / (r0["itl_p99_ms"] or 1) * 100
         print(f"{'ITL p99 (ms)':<20} {r0['itl_p99_ms']:>12.1f} {r256['itl_p99_ms']:>12.1f} {itl_improve:>+9.1f}%")
         print(f"{'ITL p50 (ms)':<20} {r0['itl_p50_ms']:>12.1f} {r256['itl_p50_ms']:>12.1f}")
-        itl_ratio_0   = r0['itl_p99_ms'] / r0['itl_p50_ms']
-        itl_ratio_256 = r256['itl_p99_ms'] / r256['itl_p50_ms']
+        itl_ratio_0   = r0['itl_p99_ms'] / (r0['itl_p50_ms'] or 1)
+        itl_ratio_256 = r256['itl_p99_ms'] / (r256['itl_p50_ms'] or 1)
         print(f"{'ITL p99/p50 比值':<20} {itl_ratio_0:>12.2f} {itl_ratio_256:>12.2f}  (越接近1越稳定)")
         print(f"{'TTFT p99 (ms)':<20} {r0['ttft_p99_ms']:>12.1f} {r256['ttft_p99_ms']:>12.1f}")
-        tput_change = (r256['throughput'] - r0['throughput']) / r0['throughput'] * 100
+        tput_change = (r256['throughput'] - r0['throughput']) / (r0['throughput'] or 1) * 100
         print(f"{'Throughput (tok/s)':<20} {r0['throughput']:>12.1f} {r256['throughput']:>12.1f} {tput_change:>+9.1f}%")
         print("="*60)
         print("\n解读：")
         print(f"  ITL p99/p50 比值: chunk=0 时为 {itl_ratio_0:.2f}x，chunk=256 时为 {itl_ratio_256:.2f}x")
         print(f"  比值越接近 1.0 说明 ITL 越稳定（无毛刺）")
         if itl_ratio_256 < itl_ratio_0 * 0.8:
-            print(f"  ✓ chunked prefill 有效：ITL 稳定性提升 {(1-itl_ratio_256/itl_ratio_0)*100:.0f}%")
+            print(f"  ✓ chunked prefill 有效：ITL 稳定性提升 {(1-itl_ratio_256/(itl_ratio_0 or 1))*100:.0f}%")
         else:
             print(f"  ✗ 改善不明显，尝试增大 --max-tokens 或使用更长的 long prompt")
     else:
