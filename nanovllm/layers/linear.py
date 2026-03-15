@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from nanovllm.layers.quant_kernel import w4a16_gemm, pack_weight_to_int4
 
 
 def divide(numerator, denominator):
@@ -151,3 +152,100 @@ class RowParallelLinear(LinearBase):
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y
+
+
+class W4A16Linear(nn.Module):
+    """
+    Weight-only INT4 quantized linear (single GPU / replicated).
+
+    Weights are stored as packed int4 (half-split format, group_size=128).
+    Activations remain FP16. Forward uses Triton fused dequant+GEMM kernel.
+    """
+
+    def __init__(self, input_size: int, output_size: int, group_size: int = 128):
+        super().__init__()
+        assert input_size % group_size == 0, \
+            f"input_size={input_size} must be divisible by group_size={group_size}"
+        self.input_size = input_size
+        self.output_size = output_size
+        self.group_size = group_size
+        num_groups = input_size // group_size
+
+        self.register_buffer("weight_packed",
+                             torch.empty(input_size // 2, output_size, dtype=torch.uint8))
+        self.register_buffer("scales",
+                             torch.empty(num_groups, output_size, dtype=torch.float16))
+        self.register_buffer("zeros",
+                             torch.empty(num_groups, output_size, dtype=torch.float16))
+
+    def pack_weights(self, weight: torch.Tensor):
+        """Quantize and pack FP16 weight [output_size, input_size]."""
+        w_packed, scales, zeros = pack_weight_to_int4(weight, self.group_size)
+        self.weight_packed.copy_(w_packed)
+        self.scales.copy_(scales)
+        self.zeros.copy_(zeros)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, self.input_size)
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+        y = w4a16_gemm(x_2d, self.weight_packed, self.scales, self.zeros, self.group_size)
+        return y.view(*orig_shape[:-1], self.output_size)
+
+
+class W4A16ColumnParallelLinear(W4A16Linear):
+    """Column-parallel W4A16 linear (output dimension is already TP-sharded).
+    No all_reduce needed: output is a TP shard, consumer handles aggregation."""
+    pass
+
+
+class W4A16RowParallelLinear(W4A16Linear):
+    """Row-parallel W4A16 linear (input dimension is TP-sharded, output needs all_reduce)."""
+
+    def __init__(self, input_size: int, output_size: int, group_size: int = 128):
+        super().__init__(input_size, output_size, group_size)
+        self.tp_size = dist.get_world_size() if dist.is_initialized() else 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = super().forward(x)
+        if self.tp_size > 1:
+            dist.all_reduce(y)
+        return y
+
+
+def quantize_model(model: nn.Module, group_size: int = 128) -> None:
+    """
+    In-place replace ColumnParallelLinear/RowParallelLinear with W4A16 variants.
+
+    Must be called after FP16 weights are loaded. Each rank quantizes its own
+    TP shard independently (sharding is already done by weight_loader).
+
+    QKVParallelLinear and MergedColumnParallelLinear are intentionally skipped
+    (complex multi-shard weight_loader logic; not yet supported).
+    """
+    replacements = []
+    for name, module in model.named_modules():
+        if isinstance(module, (QKVParallelLinear, MergedColumnParallelLinear)):
+            continue
+        if isinstance(module, ColumnParallelLinear):
+            replacements.append((name, module, "column"))
+        elif isinstance(module, RowParallelLinear):
+            replacements.append((name, module, "row"))
+
+    for name, module, kind in replacements:
+        out_f, in_f = module.weight.shape  # LinearBase stores [out, in]
+        if kind == "column":
+            new_layer = W4A16ColumnParallelLinear(in_f, out_f, group_size)
+        else:
+            new_layer = W4A16RowParallelLinear(in_f, out_f, group_size)
+        new_layer.to(module.weight.device)
+        new_layer.pack_weights(module.weight.data)
+
+        # Navigate to parent and set attribute
+        parts = name.rsplit(".", 1)
+        if len(parts) == 2:
+            parent = model.get_submodule(parts[0])
+            setattr(parent, parts[1], new_layer)
+        else:
+            setattr(model, name, new_layer)

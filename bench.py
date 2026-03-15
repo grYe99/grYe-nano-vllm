@@ -12,7 +12,8 @@ def main():
     max_ouput_len = 1024
 
     path = os.path.expanduser("./assets/Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
+    # llm = LLM(path, enforce_eager=False, max_model_len=4096)
+    llm = LLM(path, enforce_eager=False, max_model_len=4096, quantize=True)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]

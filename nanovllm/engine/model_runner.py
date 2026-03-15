@@ -36,6 +36,9 @@ class ModelRunner:
         # vllm是动态选择要加载模型结构类型的
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        if config.quantize:
+            from nanovllm.layers.linear import quantize_model
+            quantize_model(self.model)
         self.sampler = Sampler()
         self.warmup_model() # 探测模型在最大负载下的显存峰值emory_stats()["allocated_bytes.all.peak"]，为后续 KV cache 分配计算可用空间
         self.allocate_kv_cache()
