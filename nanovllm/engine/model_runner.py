@@ -149,7 +149,7 @@ class ModelRunner:
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q) # 累加需要计算q的tokens数量
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
@@ -161,9 +161,13 @@ class ModelRunner:
                     end = start + self.block_size
                 else:
                     end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+                slot_mapping.extend(list(range(start, end))) #每个block的逻辑GPU显存位置
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # hit prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        # pin_memory=True表示将CPU数据分配在“锁页内存”中，表示它不会被交换到磁盘，这样它的内存的物理地址不会变化，直接通过DMA（直接内存访问）来访问。
+        # 如果pin_memory=False，那么表示CPU内存地址可能会变，DMA时就需要额外拷贝到地址不变的临时缓冲区
+        # non_blocking=True表示CPU到GPU的数据传输不阻塞（tensor.cuda()是同步操作）要开启的前提是CPU内存的地址不变
+        # 此处频繁分配无法被交换的pinned内存，容易造成内存碎片，因此vllm是pinned内存池
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -178,7 +182,7 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            input_ids.append(seq.last_token)
+            input_ids.append(seq.last_token) # decode只用最新token的Q与所有历史KV计算，生成下一个token
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
