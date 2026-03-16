@@ -167,7 +167,7 @@ class ModelRunner:
         # pin_memory=True表示将CPU数据分配在“锁页内存”中，表示它不会被交换到磁盘，这样它的内存的物理地址不会变化，直接通过DMA（直接内存访问）来访问。
         # 如果pin_memory=False，那么表示CPU内存地址可能会变，DMA时就需要额外拷贝到地址不变的临时缓冲区
         # non_blocking=True表示CPU到GPU的数据传输不阻塞（tensor.cuda()是同步操作）要开启的前提是CPU内存的地址不变
-        # 此处频繁分配无法被交换的pinned内存，容易造成内存碎片，因此vllm是pinned内存池
+        # 此处频繁分配无法被交换的pinned内存，容易造成内存碎片，因此vllm是pinned内存池；内存释放后pin标记清除，这块内存恢复可用
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
