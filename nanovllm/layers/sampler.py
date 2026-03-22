@@ -17,3 +17,11 @@ class Sampler(nn.Module):
         # Gumbel-max trick（exponential_ + div_ + argmax）
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
         return sample_tokens
+
+    def forward_with_probs(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        logits = logits.float().div_(temperatures.unsqueeze(dim=1))
+        probs = torch.softmax(logits, dim=-1)
+        # Use non-in-place division to avoid mutating probs
+        noise = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
+        sample_tokens = (probs / noise).argmax(dim=-1)
+        return sample_tokens, probs

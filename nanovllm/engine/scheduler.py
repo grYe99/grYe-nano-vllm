@@ -55,6 +55,7 @@ class Scheduler:
                 num_seqs += 1
                 self.block_manager.may_append(seq) # append后，当前block写满，记录hash；上个block写满，新建block
                 scheduled_seqs.append(seq)
+        # assert失败情况：抢占了所有running的seq，并且自己也抢占了，因此为empty，意味着就算自己独占所有block也跑不起来（超长序列）
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
@@ -77,3 +78,18 @@ class Scheduler:
                 self.running.remove(seq)
                 if self.metrics:
                     self.metrics.on_request_finished(seq)
+
+    def postprocess_multi(self, seqs: list, tokens_per_seq: list) -> None:
+        """tokens_per_seq[i] is the list of accepted tokens for seqs[i] (1 to k+1 tokens)."""
+        for seq, token_list in zip(seqs, tokens_per_seq):
+            for token_id in token_list:
+                seq.append_token(token_id)
+                if self.metrics:
+                    self.metrics.on_token_generated(seq)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+                    if self.metrics:
+                        self.metrics.on_request_finished(seq)
+                    break

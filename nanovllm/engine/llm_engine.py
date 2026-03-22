@@ -34,9 +34,13 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         self.scheduler.metrics = self.metrics
+        self._exited = False
         atexit.register(self.exit)
 
     def exit(self):
+        if self._exited:
+            return
+        self._exited = True
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:

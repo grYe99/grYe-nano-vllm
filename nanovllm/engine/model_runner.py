@@ -14,7 +14,7 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], store_name: str = "nanovllm_dist_store"):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -23,12 +23,15 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        self._owns_process_group = False
         if self.world_size > 1:
             dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        else:
+            self._owns_process_group = True
+        elif not dist.is_initialized():
             import tempfile, os as _os
-            store = dist.FileStore(_os.path.join(tempfile.gettempdir(), "nanovllm_dist_store"), 1)
+            store = dist.FileStore(_os.path.join(tempfile.gettempdir(), store_name), 1)
             dist.init_process_group("gloo", store=store, rank=0, world_size=1)
+            self._owns_process_group = True
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -64,8 +67,21 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        if dist.is_initialized():
+        if self._owns_process_group and dist.is_initialized():
             dist.destroy_process_group()
+        if hasattr(self, "model"):
+            # clear kv_cache views held by attention modules before deleting
+            for module in self.model.modules():
+                if hasattr(module, "k_cache"):
+                    del module.k_cache
+                if hasattr(module, "v_cache"):
+                    del module.v_cache
+            del self.model
+        if hasattr(self, "kv_cache"):
+            del self.kv_cache
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def loop(self):
         while True:
@@ -230,6 +246,20 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    @torch.inference_mode()
+    def run_logits_only(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool) -> torch.Tensor:
+        """Return raw hidden states [total_tokens, hidden_size], no sampling, no context reset (caller's responsibility)."""
+        return self.run_model(input_ids, positions, is_prefill)
+
+    def run_with_probs(self, seqs: list, is_prefill: bool):
+        """Same as run() but also returns probs tensor [batch, vocab]."""
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, is_prefill)
+        token_ids, probs = self.sampler.forward_with_probs(logits, temperatures) if self.rank == 0 else (None, None)
+        reset_context()
+        return token_ids.tolist() if token_ids is not None else None, probs
 
     @torch.inference_mode()
     def capture_cudagraph(self):
