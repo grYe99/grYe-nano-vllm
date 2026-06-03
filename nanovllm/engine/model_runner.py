@@ -23,7 +23,13 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if self.world_size > 1:
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        else:
+            import tempfile, os as _os
+            store = dist.FileStore(_os.path.join(tempfile.gettempdir(), "nanovllm_dist_store"), 1)
+            dist.init_process_group("gloo", store=store, rank=0, world_size=1)
+        
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
