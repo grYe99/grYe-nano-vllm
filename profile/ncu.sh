@@ -1,0 +1,1 @@
+ncu --set full -o ncu python ../example.py
