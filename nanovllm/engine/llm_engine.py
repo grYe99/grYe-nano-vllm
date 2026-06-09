@@ -87,7 +87,17 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        all_seqs = sorted(self.scheduler.finished, key=lambda s: s.seq_id)
+        results = []
+        for seq, token_ids in zip(all_seqs, outputs):
+            ttft = (seq.first_token_time - seq.arrival_time) * 1000  # ms
+            tpot = ((seq.completion_time - seq.first_token_time) / max(1, seq.num_completion_tokens)) * 1000  # ms
+            results.append({
+                "text": self.tokenizer.decode(token_ids),
+                "token_ids": token_ids,
+                "ttft_ms": ttft,
+                "tpot_ms": tpot,
+            })
         if use_tqdm:
             pbar.close()
-        return outputs
+        return results

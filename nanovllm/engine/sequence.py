@@ -1,6 +1,7 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from time import perf_counter
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -27,6 +28,9 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.arrival_time = perf_counter()
+        self.first_token_time = 0.0
+        self.completion_time = 0.0
 
     def __len__(self):
         return self.num_tokens
@@ -67,6 +71,9 @@ class Sequence:
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
+        if self.num_completion_tokens == 0:
+            self.first_token_time = perf_counter()
+        self.completion_time = perf_counter()
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1

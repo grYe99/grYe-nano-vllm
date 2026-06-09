@@ -21,11 +21,18 @@ def main():
 
     llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()
-    llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    outputs = llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
     t = (time.time() - t)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     throughput = total_tokens / t
-    print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
+
+    ttfts = [o["ttft_ms"] for o in outputs]
+    tpots = [o["tpot_ms"] for o in outputs]
+    avg_ttft = sum(ttfts) / len(ttfts)
+    avg_tpot = sum(tpots) / len(tpots)
+    print(f"Total: {total_tokens} tok, Time: {t:.2f}s, Throughput: {throughput:.2f} tok/s")
+    print(f"TTFT:  {avg_ttft:.1f} ms (avg)")
+    print(f"TPOT:  {avg_tpot:.2f} ms (avg)")
 
 
 if __name__ == "__main__":

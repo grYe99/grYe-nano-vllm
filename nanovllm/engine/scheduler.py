@@ -14,6 +14,7 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.finished: list[Sequence] = []
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -69,3 +70,4 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+                self.finished.append(seq)
