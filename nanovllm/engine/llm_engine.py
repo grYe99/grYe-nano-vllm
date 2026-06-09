@@ -27,6 +27,7 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
+        self.config = config
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
@@ -55,6 +56,23 @@ class LLMEngine:
 
     def is_finished(self):
         return self.scheduler.is_finished()
+
+    def compute_logprobs(self, prompts: list[tuple[list[int], list[int]]]) -> list[tuple[float, bool]]:
+        """Compute summed logprobs and greedy status for batched prompts.
+
+        Args:
+            prompts: list of (context_tokens, continuation_tokens) pairs.
+        Returns:
+            list of (sum_logprob, is_greedy) for each prompt pair.
+            is_greedy is True if every continuation token is the argmax prediction.
+        """
+        seqs = []
+        for ctx_tokens, cont_tokens in prompts:
+            full_tokens = ctx_tokens + cont_tokens
+            seq = Sequence(full_tokens)
+            seq.num_prompt_tokens = len(ctx_tokens)
+            seqs.append(seq)
+        return self.model_runner.call("compute_logprobs", seqs)
 
     def generate(
         self,

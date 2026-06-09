@@ -1,5 +1,6 @@
 import pickle
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -218,6 +219,73 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    @torch.inference_mode()
+    def compute_logprobs(self, seqs: list[Sequence]) -> list[tuple[float, bool]]:
+        """Compute summed logprobs and greedy status for continuation tokens.
+
+        Each sequence's first num_prompt_tokens tokens are treated as context,
+        and the remaining tokens as continuation. Returns (sum_logprob, is_greedy)
+        for each sequence, where is_greedy=True iff all continuation tokens are
+        the argmax prediction.
+        """
+        assert self.world_size == 1, "compute_logprobs requires TP=1"
+        input_ids, positions = self.prepare_prefill(seqs)
+        ctx = get_context()
+
+        # Override slot_mapping with -1 to skip KV cache writes
+        total_tokens = ctx.cu_seqlens_q[-1].item()
+        ctx.slot_mapping = torch.full((total_tokens,), -1, dtype=torch.int32, device="cuda")
+
+        # Get hidden states (bypass ParallelLMHead which only returns last-token logits)
+        hidden_states = self.model(input_ids, positions)  # [total_tokens, hidden_size]
+
+        # Select hidden positions that predict continuation tokens
+        cu_seqlens_q = ctx.cu_seqlens_q
+        selected_list = []
+        target_list = []
+        for i, seq in enumerate(seqs):
+            start = cu_seqlens_q[i].item()
+            ctx_len = seq.num_prompt_tokens
+            cont_len = len(seq) - ctx_len
+            if cont_len == 0:
+                continue
+            hs_start = start + ctx_len - 1
+            hs_end = hs_start + cont_len
+            selected_list.append(hidden_states[hs_start:hs_end])
+            target_list.extend(seq[ctx_len:])
+
+        if not selected_list:
+            reset_context()
+            return []
+
+        selected = torch.cat(selected_list, dim=0)  # [total_cont_tokens, hidden_size]
+        targets = torch.tensor(target_list, device="cuda", dtype=torch.int64)
+
+        # Compute logits manually for selected positions
+        logits = F.linear(selected.float(), self.model.lm_head.weight.float())
+        log_probs = F.log_softmax(logits, dim=-1)
+        token_logprobs = log_probs[torch.arange(len(targets), device="cuda"), targets]
+
+        # Check greedy: every continuation token is argmax
+        argmax = logits.argmax(dim=-1)
+        is_greedy = argmax == targets  # [total_cont_tokens]
+
+        # Split back by sequence
+        result = []
+        idx = 0
+        for seq in seqs:
+            cont_len = len(seq) - seq.num_prompt_tokens
+            if cont_len == 0:
+                result.append((0.0, False))
+            else:
+                sum_lp = token_logprobs[idx:idx + cont_len].sum().item()
+                greedy = is_greedy[idx:idx + cont_len].all().item()
+                result.append((sum_lp, greedy))
+            idx += cont_len
+
+        reset_context()
+        return result
 
     @torch.inference_mode()
     def capture_cudagraph(self):
