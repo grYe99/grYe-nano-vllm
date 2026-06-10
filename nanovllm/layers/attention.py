@@ -5,6 +5,8 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+from nanovllm.layers.kvcache_int8 import store_kvcache_int8
+from nanovllm.layers.paged_attention import paged_attention
 
 
 @triton.jit
@@ -55,21 +57,47 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale_cache = self.v_scale_cache = None  # set when using INT8 quantization
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-        else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+        use_int8 = self.k_scale_cache is not None
+
+        if use_int8:
+            if k_cache.numel() and v_cache.numel():
+                store_kvcache_int8(k, v, k_cache, v_cache, self.k_scale_cache, self.v_scale_cache, context.slot_mapping)
+               
+            if context.is_prefill and context.block_tables is None:
+                # Fresh prefill: K/V is contiguous, no cache lookup
+                o = flash_attn_varlen_func(q, k, v,
+                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                        softmax_scale=self.scale, causal=True, block_table=None)
+            else:
+                # Prefix-cache prefill or decode: use unified paged attention kernel
+                o = paged_attention(
+                    q, k_cache, v_cache,
+                    self.k_scale_cache, self.v_scale_cache,
+                    context.block_tables,
+                    context.seq_lens,
+                    context.cu_seqlens_q,
+                    self.scale,
+                    kv_quant_mode=2 if use_int8 else 0,
+                    is_prefill=context.is_prefill,
+                )
+        else:
+            if k_cache.numel() and v_cache.numel():
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            if context.is_prefill:
+                if context.block_tables is not None:    # prefix cache
+                    k, v = k_cache, v_cache
+                o = flash_attn_varlen_func(q, k, v,
+                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+            else:    # decode
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                            softmax_scale=self.scale, causal=True)
         return o
