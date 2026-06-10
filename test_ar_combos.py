@@ -33,6 +33,7 @@ def main():
         for o in output:
             print(f"  {o['text'][:80]}")
         print()
+        llm.exit()
 
     baseline = results["sync + plain"]
     print("=== Correctness Check ===")
