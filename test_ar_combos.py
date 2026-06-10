@@ -3,6 +3,7 @@
 
 import sys
 from nanovllm import LLM
+from nanovllm.sampling_params import SamplingParams
 
 
 def main():
@@ -26,7 +27,7 @@ def main():
     for combo in COMBOS:
         print(f"--- Testing: {combo['label']} ---")
         llm = LLM(MODEL_PATH, tensor_parallel_size=2, **{k: combo[k] for k in ("ar_async_chunked", "ar_fused_norm")})
-        output = llm.generate(prompts, max_tokens=32)
+        output = llm.generate(prompts, SamplingParams(max_tokens=32))
         token_ids = tuple(tuple(o["token_ids"]) for o in output)
         results[combo["label"]] = token_ids
         for o in output:
