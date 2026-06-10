@@ -24,6 +24,11 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # Async chunked all_reduce is incompatible with CUDA graphs
+        from nanovllm.utils.ar_mode import get_ar_async_chunked
+        if get_ar_async_chunked():
+            self.enforce_eager = True
+
         if self.world_size > 1:
             dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         else:

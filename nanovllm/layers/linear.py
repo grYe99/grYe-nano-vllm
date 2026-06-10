@@ -146,8 +146,57 @@ class RowParallelLinear(LinearBase):
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_sync(self, x: torch.Tensor) -> torch.Tensor:
+        """ar_async_chunked=False, ar_fused_norm=False: F.linear + synchronous all_reduce."""
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y
+
+    def _forward_pass(self, x: torch.Tensor) -> torch.Tensor:
+        """ar_fused_norm=True, ar_async_chunked=False: F.linear only (AR in FusedAllReduceRMSNorm)."""
+        return F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+
+    def _forward_chunked(self, x: torch.Tensor) -> torch.Tensor:
+        """ar_async_chunked=True: chunked F.linear with async all_reduce for overlap.
+
+        Splits the token dimension into chunks and pipelines each chunk's
+        GEMM with the previous chunk's all_reduce so that communication and
+        computation overlap on the GPU.
+        """
+        if self.tp_size <= 1:
+            return F.linear(x, self.weight, self.bias)
+
+        from nanovllm.utils.ar_mode import get_ar_num_chunks, get_ar_min_tokens
+
+        num_tokens = x.size(0)
+        if num_tokens < get_ar_min_tokens():
+            return self._forward_sync(x)
+
+        num_chunks = min(get_ar_num_chunks(), num_tokens)
+        chunks = x.chunk(num_chunks)
+        handles = []
+        output_chunks = []
+
+        for i, chunk in enumerate(chunks):
+            y = F.linear(chunk, self.weight, None)
+            h = dist.all_reduce(y, async_op=True)
+            if i > 0:
+                handles[i - 1].wait()
+            handles.append(h)
+            output_chunks.append(y)
+
+        handles[-1].wait()
+        y = torch.cat(output_chunks, dim=0)
+        if self.bias is not None and self.tp_rank == 0:
+            y = y + self.bias
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from nanovllm.utils.ar_mode import get_ar_async_chunked, get_ar_fused_norm
+
+        if get_ar_async_chunked():
+            return self._forward_chunked(x)
+        if get_ar_fused_norm():
+            return self._forward_pass(x)
+        return self._forward_sync(x)

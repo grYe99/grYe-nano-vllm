@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from nanovllm.utils import ar_mode
+
 
 @dataclass
 class Config:
@@ -16,6 +18,8 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    ar_async_chunked: bool = False
+    ar_fused_norm: bool = True
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -24,3 +28,7 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        ar_mode.configure(
+            ar_async_chunked=self.ar_async_chunked,
+            ar_fused_norm=self.ar_fused_norm,
+        )
