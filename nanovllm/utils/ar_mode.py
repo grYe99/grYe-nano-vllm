@@ -13,6 +13,10 @@ def configure(
     ar_min_tokens: int = 1024,
 ) -> None:
     global _AR_ASYNC_CHUNKED, _AR_FUSED_NORM, _AR_NUM_CHUNKS, _AR_MIN_TOKENS
+    # Env var takes priority for backward compatibility
+    env = _resolve_from_env()
+    if env is not None:
+        ar_async_chunked, ar_fused_norm = env
     _AR_ASYNC_CHUNKED = ar_async_chunked
     _AR_FUSED_NORM = ar_fused_norm
     _AR_NUM_CHUNKS = ar_num_chunks
