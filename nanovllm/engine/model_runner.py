@@ -24,9 +24,15 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # Propagate ar_mode to child processes (pickle skips Config.__post_init__)
+        from nanovllm.utils import ar_mode
+        ar_mode.configure(
+            ar_async_chunked=config.ar_async_chunked,
+            ar_fused_norm=config.ar_fused_norm,
+        )
+
         # Async chunked all_reduce is incompatible with CUDA graphs
-        from nanovllm.utils.ar_mode import get_ar_async_chunked
-        if get_ar_async_chunked():
+        if ar_mode.get_ar_async_chunked():
             self.enforce_eager = True
 
         if self.world_size > 1:

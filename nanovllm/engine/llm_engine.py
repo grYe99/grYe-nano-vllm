@@ -35,7 +35,11 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
+        # Guard against atexit double-call after manual llm.exit()
+        mr = getattr(self, "model_runner", None)
+        if mr is None:
+            return
+        mr.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
