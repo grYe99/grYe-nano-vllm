@@ -29,16 +29,15 @@ class ModelRunner:
             torch.cuda.set_device(rank)
             dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
             if self.config.pynccl:
-                # Bootstrap NCCL unique ID via Gloo CPU group,
-                # avoiding NCCL-to-bootstrap-NCCL circular dependency
+                # Bootstrap NCCL unique ID via Gloo CPU group.
                 cpu_group = dist.new_group(backend="gloo")
                 uid_tensor = torch.zeros(128, dtype=torch.uint8)
                 if rank == 0:
-                    from nanovllm.utils.pynccl import _find_libnccl
-                    libnccl = ctypes.CDLL(_find_libnccl())
+                    from nanovllm.utils.pynccl import _find_system_nccl
+                    libnccl = ctypes.CDLL(_find_system_nccl())
                     uid = (ctypes.c_uint8 * 128)()
                     libnccl.ncclGetUniqueId(uid)
-                    uid_tensor = torch.frombuffer(bytes(uid), dtype=torch.uint8)
+                    uid_tensor = torch.frombuffer(bytearray(uid), dtype=torch.uint8)
                 dist.broadcast(uid_tensor, src=0, group=cpu_group)
                 from nanovllm.utils.pynccl import init_communicator
                 init_communicator(self.world_size, rank, bytes(uid_tensor.tolist()))
@@ -62,6 +61,13 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
+                # Clean up stale shared memory from previous runs
+                try:
+                    _old = SharedMemory(name="nanovllm")
+                    _old.close()
+                    _old.unlink()
+                except FileNotFoundError:
+                    pass
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
             else:
@@ -82,9 +88,12 @@ class ModelRunner:
 
     def loop(self):
         while True:
-            method_name, args = self.read_shm()
-            self.call(method_name, *args)
-            if method_name == "exit":
+            try:
+                method_name, args = self.read_shm()
+                self.call(method_name, *args)
+                if method_name == "exit":
+                    break
+            except Exception:
                 break
 
     def read_shm(self):

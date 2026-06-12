@@ -1,69 +1,94 @@
+"""PyNccl communicator — raw NCCL all_reduce via ctypes.
+
+Uses the system NCCL library (libnccl.so.2 → /usr/lib/x86_64-linux-gnu/
+libnccl.so.2.25.1) which correctly establishes ring connections on this
+platform.  The conda-bundled NCCL (nvidia-nccl-cu12) produces broken
+communicators where ncclAllReduce corrupts tensor data.
+"""
+
 import ctypes
+import functools
 import os
 
 import torch
+from torch.distributed import ReduceOp
 
-_NCCL_COMM = None
-# Global reference to loaded NCCL library, used by _check for error strings
-_nccl_lib = None
-
-# ncclResult_t constants
-_NCCL_OK = 0
-_nccl_sum = 0
-_nccl_float = 0
-_nccl_float16 = 1
-_nccl_bfloat16 = 2
-_nccl_int32 = 3
+# === ctypes type aliases ===
+ncclResult_t = ctypes.c_int
+ncclComm_t = ctypes.c_void_p
 
 
-# ncclUniqueId struct (128-byte opaque buffer)
-class NcclUniqueId(ctypes.Structure):
-    _fields_ = [("internal", ctypes.c_uint8 * 128)]
+class ncclUniqueId(ctypes.Structure):
+    _fields_ = [("internal", ctypes.c_byte * 128)]
 
 
-def _check(result: int, context: str = "") -> None:
-    if result != _NCCL_OK:
-        msg = f"NCCL error code: {result}"
-        if _nccl_lib is not None:
-            try:
-                error_str = _nccl_lib.ncclGetErrorString(result)
-                msg += f" ({error_str})"
-            except Exception:
-                pass
-        if context:
-            msg = f"{context}: {msg}"
-        raise RuntimeError(msg)
+# === NCCL data-type / reduce-op helpers (same numbering as nccl.h) ===
+
+class ncclDataTypeEnum:
+    ncclFloat16 = 6
+    ncclFloat32 = 7
+    ncclBfloat16 = 9
+
+    _map: dict[torch.dtype, int] = {
+        torch.float16: ncclFloat16,
+        torch.float32: ncclFloat32,
+        torch.bfloat16: ncclBfloat16,
+    }
+
+    @classmethod
+    def from_torch(cls, dtype: torch.dtype) -> int:
+        v = cls._map.get(dtype)
+        if v is None:
+            raise TypeError(f"Unsupported dtype {dtype} for NCCL all_reduce")
+        return v
 
 
-def _find_libnccl() -> str:
-    """Locate libnccl.so.
+class ncclRedOpTypeEnum:
+    ncclSum = 0
 
-    Priority:
-    1. PYNCCL_SO_PATH environment variable
-    2. PyTorch's bundled nvidia NCCL package
-    3. System paths (libnccl.so, libnccl.so.2)
-    """
-    so_path = os.environ.get("PYNCCL_SO_PATH")
-    if so_path:
-        return so_path
-    # Check PyTorch's bundled nvidia NCCL package
-    torch_dir = os.path.dirname(torch.__file__)
-    nv_nccl = os.path.join(torch_dir, "..", "nvidia", "nccl", "lib", "libnccl.so.2")
-    nv_nccl = os.path.normpath(nv_nccl)
-    if os.path.exists(nv_nccl):
-        return nv_nccl
-    # Fallback to system paths
-    for name in ["libnccl.so", "libnccl.so.2"]:
-        try:
-            ctypes.CDLL(name, mode=ctypes.RTLD_NOLOAD)
-            return name
-        except OSError:
-            continue
-    msg = (
-        "libnccl.so not found. Install NCCL via: "
-        "pip install nvidia-nccl-cu12"
-    )
-    raise OSError(msg)
+    @classmethod
+    def from_torch(cls, op: ReduceOp) -> int:
+        assert op == ReduceOp.SUM, "only SUM is supported"
+        return cls.ncclSum
+
+
+# === NCCL library loader (system lib, NOT conda-bundled) ===
+
+_INTERNAL: dict[str, dict[str, ctypes.CDLL | dict]] = {}
+"""Cache: so_file → {lib: CDLL, funcs: {name: ctypes function}}."""
+
+
+def _find_system_nccl() -> str:
+    """Return path to the system libnccl.so.2 (never the conda-bundled one)."""
+    return "libnccl.so.2"  # resolves via ldconfig to /usr/lib/.../libnccl.so.2.25.1
+
+
+def _nccl_lib() -> dict[str, object]:
+    so = _find_system_nccl()
+    if so not in _INTERNAL:
+        lib = ctypes.CDLL(so)
+        funcs: dict[str, object] = {}
+        for name, restype, argtypes in [
+            ("ncclCommInitRank", ncclResult_t,
+             [ctypes.POINTER(ncclComm_t), ctypes.c_int, ncclUniqueId, ctypes.c_int]),
+            ("ncclAllReduce", ncclResult_t,
+             [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+              ctypes.c_int, ctypes.c_int, ncclComm_t, ctypes.c_void_p]),
+            ("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+            ("ncclGetUniqueId", ncclResult_t, [ctypes.POINTER(ncclUniqueId)]),
+            ("ncclCommCount", ncclResult_t, [ncclComm_t, ctypes.POINTER(ctypes.c_int)]),
+        ]:
+            f = getattr(lib, name)
+            f.restype = restype
+            f.argtypes = argtypes
+            funcs[name] = f
+        _INTERNAL[so] = {"lib": lib, "funcs": funcs}
+    return _INTERNAL[so]
+
+
+# === public API ===
+
+_NCCL_COMM: "NcclCommunicator | None" = None
 
 
 def init_communicator(world_size: int, rank: int, unique_id: bytes) -> None:
@@ -89,93 +114,47 @@ def is_initialized() -> bool:
 
 class NcclCommunicator:
 
-    def __init__(self, world_size: int, rank: int, unique_id: bytes):
-        if len(unique_id) != 128:
-            raise ValueError(
-                f"unique_id must be exactly 128 bytes, got {len(unique_id)}"
-            )
+    def __init__(self, world_size: int, rank: int, unique_id: bytes) -> None:
         self.world_size = world_size
         self.rank = rank
-        self._lib = ctypes.CDLL(_find_libnccl())
-        global _nccl_lib
-        _nccl_lib = self._lib
-        self._init_nccl_types()
-        self._setup_argtypes()
-        # Parse unique_id bytes into ncclUniqueId struct
-        uid = NcclUniqueId()
-        ctypes.memmove(ctypes.byref(uid), unique_id, 128)
-        comm = ctypes.c_void_p()
-        _check(
-            self._lib.ncclCommInitRank(
-                ctypes.byref(comm),
-                ctypes.c_int(world_size),
-                uid,
-                ctypes.c_int(rank),
-            ),
-            context="ncclCommInitRank",
-        )
-        self._comm = comm
+        self._funcs = _nccl_lib()["funcs"]
 
-    def _init_nccl_types(self) -> None:
-        self._dtype_map: dict[torch.dtype, int] = {
-            torch.float32: _nccl_float,
-            torch.float16: _nccl_float16,
-            torch.bfloat16: _nccl_bfloat16,
-            torch.int32: _nccl_int32,
-        }
+        uid = ncclUniqueId()
+        ctypes.memmove(ctypes.addressof(uid.internal), unique_id, 128)
 
-    def _setup_argtypes(self) -> None:
-        # ncclAllReduce: sendbuff, recvbuff, count, datatype, op, comm, stream
-        self._lib.ncclAllReduce.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_size_t,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        self._lib.ncclAllReduce.restype = ctypes.c_int
-        # ncclGetErrorString: ncclResult_t → const char*
-        self._lib.ncclGetErrorString.argtypes = [ctypes.c_int]
-        self._lib.ncclGetErrorString.restype = ctypes.c_char_p
-        # ncclCommDestroy: comm
-        self._lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
-        self._lib.ncclCommDestroy.restype = ctypes.c_int
+        with torch.accelerator.device_index(rank):
+            comm = ncclComm_t()
+            self._funcs["ncclCommInitRank"](
+                ctypes.byref(comm), world_size, uid, rank,
+            )
+            self.comm = comm
+
+            # Warmup: small all_reduce triggers ring setup
+            data = torch.zeros(1, device=f"cuda:{rank}")
+            self.all_reduce(data)
+            torch.cuda.synchronize()
+            del data
 
     def all_reduce(self, tensor: torch.Tensor) -> None:
-        if not tensor.is_cuda:
-            raise ValueError(
-                f"all_reduce requires a CUDA tensor, got {tensor.device}"
-            )
+        assert tensor.is_cuda, f"all_reduce requires CUDA tensor, got {tensor.device}"
         stream = torch.cuda.current_stream()
-        stream_ptr = ctypes.c_void_p(stream.cuda_stream)
-        nccl_dtype = self._dtype_map.get(tensor.dtype)
-        if nccl_dtype is None:
-            raise TypeError(
-                f"Unsupported dtype {tensor.dtype} for all_reduce. "
-                f"Supported dtypes: {list(self._dtype_map.keys())}"
-            )
-        _check(
-            self._lib.ncclAllReduce(
-                tensor.data_ptr(),
-                tensor.data_ptr(),
-                ctypes.c_size_t(tensor.numel()),
-                ctypes.c_int(nccl_dtype),
-                ctypes.c_int(_nccl_sum),
-                self._comm,
-                stream_ptr,
-            ),
-            context="ncclAllReduce",
+        self._funcs["ncclAllReduce"](
+            tensor.data_ptr(),
+            tensor.data_ptr(),
+            tensor.numel(),
+            ncclDataTypeEnum.from_torch(tensor.dtype),
+            ncclRedOpTypeEnum.from_torch(ReduceOp.SUM),
+            self.comm,
+            stream.cuda_stream,
         )
 
     def destroy(self) -> None:
-        if hasattr(self, "_comm") and self._comm and hasattr(self, "_lib"):
-            self._lib.ncclCommDestroy(self._comm)
-            self._comm = None
+        if hasattr(self, "comm") and self.comm is not None:
+            try:
+                self._funcs["ncclCommDestroy"](self.comm)
+            except Exception:
+                pass
+            self.comm = None
 
     def __del__(self) -> None:
-        try:
-            self.destroy()
-        except Exception:
-            pass
+        self.destroy()

@@ -38,7 +38,10 @@ class LLMEngine:
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
-            p.join()
+            p.join(timeout=10)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=5)
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
