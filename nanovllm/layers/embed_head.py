@@ -38,7 +38,11 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-            dist.all_reduce(y)
+            from nanovllm.utils.pynccl import get_communicator, is_initialized
+            if is_initialized():
+                get_communicator().all_reduce(y)
+            else:
+                dist.all_reduce(y)
         return y
 
 

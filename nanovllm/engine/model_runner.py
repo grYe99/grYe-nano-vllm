@@ -1,3 +1,4 @@
+import ctypes
 import pickle
 import torch
 import torch.nn.functional as F
@@ -25,13 +26,27 @@ class ModelRunner:
         self.event = event
 
         if self.world_size > 1:
+            torch.cuda.set_device(rank)
             dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+            if self.config.pynccl:
+                # Bootstrap NCCL unique ID via Gloo CPU group,
+                # avoiding NCCL-to-bootstrap-NCCL circular dependency
+                cpu_group = dist.new_group(backend="gloo")
+                uid_tensor = torch.zeros(128, dtype=torch.uint8)
+                if rank == 0:
+                    from nanovllm.utils.pynccl import _find_libnccl
+                    libnccl = ctypes.CDLL(_find_libnccl())
+                    uid = (ctypes.c_uint8 * 128)()
+                    libnccl.ncclGetUniqueId(uid)
+                    uid_tensor = torch.frombuffer(bytes(uid), dtype=torch.uint8)
+                dist.broadcast(uid_tensor, src=0, group=cpu_group)
+                from nanovllm.utils.pynccl import init_communicator
+                init_communicator(self.world_size, rank, bytes(uid_tensor.tolist()))
         else:
             import tempfile, os as _os
             store = dist.FileStore(_os.path.join(tempfile.gettempdir(), "nanovllm_dist_store"), 1)
             dist.init_process_group("gloo", store=store, rank=0, world_size=1)
-        
-        torch.cuda.set_device(rank)
+            torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
