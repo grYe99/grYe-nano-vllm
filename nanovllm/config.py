@@ -17,6 +17,7 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     kvcache_dtype: str = "auto"
+    quant_method: str | None = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -26,3 +27,9 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        # Detect quantization method from hf_config
+        qc = getattr(self.hf_config, "quantization_config", None)
+        if isinstance(qc, dict) and qc.get("quant_method") == "awq":
+            self.quant_method = "awq"
+        elif qc is not None and getattr(qc, "quant_method", None) == "awq":
+            self.quant_method = "awq"
