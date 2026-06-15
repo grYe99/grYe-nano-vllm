@@ -1,8 +1,8 @@
 """Microbenchmark: compare AWQ kernel strategies across different M values.
 
 Tests:
-  1. CUDA custom op (torch.ops.nanovllm.awq_gemm) — M ≤ 16 only
-  2. Triton fused GEMM (awq_gemm_triton)
+  1. CUDA custom op (torch.ops.nanovllm.awq_gemm) — all M
+  2. Triton fused GEMM (awq_gemm_triton) — kept for comparison
   3. dequant + cuBLAS (F.linear)
 
 Usage:
@@ -59,13 +59,10 @@ def main():
     for M in M_VALUES:
         act = torch.randn(M, K, dtype=torch.float16)
 
-        # 1. CUDA custom op (M ≤ 16 only)
-        if M <= 16:
-            def fn_cuda(a=act, w=qweight, s=scales, z=qzeros):
-                return torch.ops.nanovllm.awq_gemm(a, w, s, z, 8)
-            t_cuda = benchmark(fn_cuda, "CUDA op", M)
-        else:
-            t_cuda = float("inf")
+        # 1. CUDA custom op (all M, now that M<=16 constraint is removed)
+        def fn_cuda(a=act, w=qweight, s=scales, z=qzeros):
+            return torch.ops.nanovllm.awq_gemm(a, w, s, z, 8)
+        t_cuda = benchmark(fn_cuda, "CUDA op", M)
 
         # 2. Triton fused GEMM
         def fn_triton(a=act, w=qweight, s=scales, z=qzeros):

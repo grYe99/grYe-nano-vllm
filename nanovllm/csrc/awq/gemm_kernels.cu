@@ -293,9 +293,8 @@ torch::Tensor awq_gemm(torch::Tensor _in_feats,
               "OC must be multiple of 64, got ", num_out_channels);
   TORCH_CHECK(num_out_channels % 8 == 0,
               "OC is not multiple of pack_num = 8");
-  TORCH_CHECK(num_in_feats <= 16,
-              "M must be <= 16 for CUDA kernel, got ", num_in_feats);
-
+  // NOTE: vllm removed this M<=16 assert; the kernel handles arbitrary M
+  // via grid tiling ((M+15)/16 blocks, each processing 16 rows).
   int group_size = num_in_channels / _scaling_factors.size(0);
   TORCH_CHECK(group_size % 32 == 0,
               "Group size should be a multiple of 32");
