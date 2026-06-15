@@ -124,8 +124,9 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [M, in_features]
         M = x.size(-2)
-        if M <= 16:
-            # Small decode: CUDA Tensor Core custom op (M <= 16 constraint)
+        if M < 512:
+            # Small/medium batch (decode phase): CUDA fused Tensor Core op.
+            # vllm uses M < 256; our CUDA op stays competitive up to M=512.
             orig_dtype = x.dtype
             if x.dtype != torch.float16:
                 x = x.to(torch.float16)
@@ -134,11 +135,6 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
             if orig_dtype != torch.float16:
                 y = y.to(orig_dtype)
             return y
-        elif M < 256:
-            # Medium batch (decode phase): fused gemm avoids materializing
-            # the full weight matrix, saving bandwidth.
-            return awq_gemm_triton(x, self.qweight, self.scales, self.qzeros,
-                                   self.group_size, split_k_iters=8)
         # Large batch (prefill phase): cuBLAS GEMM is efficient enough that
         # dequant overhead is well amortized.
         weight = self._dequantize_weight()
@@ -318,8 +314,8 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
                            x.size(-1) // self.tp_size)
         M = x_shard.size(-2)
 
-        if M <= 16:
-            # Small decode: CUDA Tensor Core custom op (M <= 16 constraint)
+        if M < 512:
+            # Small/medium batch (decode phase): CUDA fused Tensor Core op.
             orig_dtype = x_shard.dtype
             if x_shard.dtype != torch.float16:
                 x_shard = x_shard.to(torch.float16)
@@ -327,10 +323,6 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
                 x_shard, self.qweight, self.scales, self.qzeros, 8)
             if orig_dtype != torch.float16:
                 y = y.to(orig_dtype)
-        elif M < 256:
-            # Medium batch: fused gemm
-            y = awq_gemm_triton(x_shard, self.qweight, self.scales, self.qzeros,
-                                self.group_size, split_k_iters=8)
         else:
             # Large batch: dequant + cuBLAS matmul
             weight = self._dequantize_weight().t().to(x.dtype)
