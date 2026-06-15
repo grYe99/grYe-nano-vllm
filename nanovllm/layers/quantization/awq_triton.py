@@ -5,147 +5,159 @@ AWQ packs 4-bit weights into int32 with a non-standard order:
   within each int32 [b0 b1 ... b31], the 8 int4 values are stored as
   indices [0, 4, 1, 5, 2, 6, 3, 7].
 
-Parameter shapes (M=out_features, K=in_features, group_size=128):
-    qweight: int32 [M, K // 8]         — packed 4-bit weights
+AWQ packs along the **output** dimension — 8 consecutive int4 values
+along the output dim are packed into one int32.
+
+Parameter shapes (K=in_features, M=out_features, group_size=128):
+    qweight: int32 [K, M // 8]         — packed 4-bit weights
     scales:  fp16  [K // 128, M]       — per-group per-row scale
     qzeros:  int32 [K // 128, M // 8]  — packed 4-bit zero points
+
+Output: fp16[K, M] — dequantized weight in (in_features, out_features) layout.
+This is the transpose of what F.linear expects, so the caller must .t() before use.
 """
 import torch
 import triton
 import triton.language as tl
 
+# AWQ pack order: reverse order maps [0,4,1,5,2,6,3,7] → [0,1,2,3,4,5,6,7]
+# shift amounts for each slot: [0, 16, 4, 20, 8, 24, 12, 28]
 AWQ_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
+AWQ_SHIFTS = [s * 4 for s in AWQ_ORDER]  # [0, 16, 4, 20, 8, 24, 12, 28]
 
 
 def awq_dequantize(qweight: torch.Tensor, scales: torch.Tensor,
                    qzeros: torch.Tensor, group_size: int = 128) -> torch.Tensor:
     """Pure-PyTorch AWQ dequantize — reference implementation.
 
-    Returns fp16 weight of shape [M, K].
+    qweight: int32[K, M//8] (K=in_features, M=out_features)
+    scales:  fp16[num_groups, M]
+    qzeros:  int32[num_groups, M//8]
+
+    Returns fp16 weight of shape [K, M] = [in_features, out_features].
     """
-    M, K8 = qweight.shape
-    K = K8 * 8
+    K, M8 = qweight.shape
+    M = M8 * 8
     num_groups = K // group_size
+    G = num_groups
 
-    order = qweight.new_tensor(AWQ_ORDER)  # [8]
+    order = torch.tensor(AWQ_ORDER, device=qweight.device)
 
-    # Unpack qweight: [M, K/8] → [M, K/8, 8] → [M, K]
-    unpacked = (qweight.unsqueeze(-1) >> (order * 4)) & 0xF       # [M, K/8, 8]
-    unpacked = unpacked.to(scales.dtype).reshape(M, K)             # [M, K]
+    # Unpack qweight: [K, M/8] with each int32 containing 8 int4 values
+    # Expand: [K, M/8] → [K, M/8, 8], then shift and mask, then reshape
+    w = (qweight.unsqueeze(-1) >> (order * 4)) & 0xF         # [K, M/8, 8]
+    w = w.to(scales.dtype).reshape(K, M)                      # [K, M]
 
-    # Unpack qzeros: [num_groups, M/8] → [num_groups, M/8, 8] → [num_groups, M]
-    z_unpacked = (qzeros.unsqueeze(-1) >> (order * 4)) & 0xF
-    z_unpacked = z_unpacked.to(scales.dtype).reshape(num_groups, M)  # [num_groups, M]
+    # Unpack qzeros: [G, M/8] → [G, M/8, 8] → [G, M]
+    z = (qzeros.unsqueeze(-1) >> (order * 4)) & 0xF           # [G, M/8, 8]
+    z = z.to(scales.dtype).reshape(G, M)                      # [G, M]
 
-    # Weight 3d: [M, num_groups, group_size]
-    w3 = unpacked.reshape(M, num_groups, group_size).permute(1, 0, 2)  # [num_groups, M, group_size]
-    z3 = z_unpacked.unsqueeze(-1)   # [num_groups, M, 1]
-    s3 = scales.unsqueeze(-1)       # [num_groups, M, 1]
+    # Reshape for group-wise dequantize
+    # w: [K, M] → [G, group_size, M]
+    w = w.reshape(G, group_size, M)                            # [G, GS, M]
+    z = z.unsqueeze(1)                                         # [G, 1,  M]
+    s = scales.unsqueeze(1)                                    # [G, 1,  M]
 
-    w3 = (w3 - z3) * s3             # [num_groups, M, group_size]
-    w3 = w3.permute(1, 0, 2)        # [M, num_groups, group_size]
-    return w3.reshape(M, K)         # [M, K]
+    w = (w - z) * s                                            # [G, GS, M]
+    w = w.reshape(K, M)                                        # [K, M]
+    return w
 
 
 @triton.jit
 def _awq_dequantize_kernel(
     qweight_ptr, scales_ptr, qzeros_ptr, output_ptr,
-    M, K, num_groups, group_size,
-    stride_qw_m, stride_qw_k8,
+    K, M, num_groups, group_size,
+    stride_qw_k, stride_qw_m8,
     stride_s_g, stride_s_m,
     stride_qz_g, stride_qz_m8,
-    stride_out_m, stride_out_k,
-    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    stride_out_k, stride_out_m,
+    BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr,
 ):
-    """Triton kernel: dequantize one tile [BLOCK_M, BLOCK_K] of the weight matrix.
+    """Triton kernel: dequantize one tile [BLOCK_K, BLOCK_M] of the weight matrix.
 
-    Each program handles a tile of the output.
+    Each program handles a (K_tile, M_tile) of the output [K, M].
     """
-    pid_m = tl.program_id(0)
-    pid_k = tl.program_id(1)
+    pid_k = tl.program_id(0)
+    pid_m = tl.program_id(1)
 
-    off_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     off_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    m_mask = off_m < M
+    off_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     k_mask = off_k < K
+    m_mask = off_m < M
 
-    # Compute which groups each k belongs to
-    group_ids = off_k // group_size            # [BLOCK_K]
-    k_within_group = off_k % group_size        # [BLOCK_K]
-    # Packed column index within the group's section of qweight
-    pack_col_in_group = k_within_group // 8    # [BLOCK_K]
-    pack_slot = k_within_group % 8             # [BLOCK_K]
+    # Which group each K element belongs to
+    group_id = off_k // group_size                             # [BLOCK_K]
+    k_in_group = off_k % group_size                            # [BLOCK_K]
 
-    # qweight column = group_id * (group_size // 8) + pack_col_in_group
-    qw_k8_off = group_ids * (group_size // 8) + pack_col_in_group  # [BLOCK_K]
+    # The packed column in qweight for this K element:
+    # qweight column = (group_size // 8) * group_id + k_in_group // 8
+    qw_m8_off = (group_size // 8) * group_id + k_in_group // 8  # [BLOCK_K]
 
-    # Load qweight tile: [BLOCK_M, BLOCK_K] mapping through qw_k8_off
-    # We need a 2D load from qweight; the column indices vary per row of the tile.
-    # Use a mask to guard out-of-bounds accesses.
-    qw_ptrs = qweight_ptr + off_m[:, None] * stride_qw_m + qw_k8_off[None, :] * stride_qw_k8
-    qw_packed = tl.load(qw_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0)  # [BLOCK_M, BLOCK_K]
+    # Load qweight tile: access qweight[off_k, qw_m8_off]
+    # qweight layout: [K, M//8]
+    qw_ptrs = qweight_ptr + off_k[:, None] * stride_qw_k + qw_m8_off[:, None] * stride_qw_m8
+    qw = tl.load(qw_ptrs, mask=k_mask[:, None] & m_mask[None, :], other=0)
 
-    # AWQ unpack: slot order within int32 is [0,4,1,5,2,6,3,7]
-    # shift amounts = [0, 16, 4, 20, 8, 24, 12, 28]
-    shift = tl.where(pack_slot == 0, 0,
-             tl.where(pack_slot == 1, 16,
-             tl.where(pack_slot == 2, 4,
-             tl.where(pack_slot == 3, 20,
-             tl.where(pack_slot == 4, 8,
-             tl.where(pack_slot == 5, 24,
-             tl.where(pack_slot == 6, 12, 28)))))))  # [BLOCK_K]
-    int4_val = (qw_packed >> shift[None, :]) & 0xF  # [BLOCK_M, BLOCK_K]
+    # Unpack: the 8 int4 slots within each int32 are at AWQ order
+    # slot = k_in_group % 8, shift = AWQ_SHIFTS[slot]
+    shift = tl.where(k_in_group % 8 == 0, 0,
+             tl.where(k_in_group % 8 == 1, 16,
+             tl.where(k_in_group % 8 == 2, 4,
+             tl.where(k_in_group % 8 == 3, 20,
+             tl.where(k_in_group % 8 == 4, 8,
+             tl.where(k_in_group % 8 == 5, 24,
+             tl.where(k_in_group % 8 == 6, 12, 28)))))))
+    w_int4 = (qw >> shift[:, None]) & 0xF                     # [BLOCK_K, BLOCK_M]
 
-    # Load scales: scales[group_id, off_m] → shape [BLOCK_M, BLOCK_K] via broadcasting
-    s_ptrs = scales_ptr + group_ids[None, :] * stride_s_g + off_m[:, None] * stride_s_m
-    s = tl.load(s_ptrs, mask=m_mask[:, None] & k_mask[None, :])  # [BLOCK_M, BLOCK_K]
+    # Load scales: scales[group_id, off_m]
+    s_ptrs = scales_ptr + group_id[:, None] * stride_s_g + off_m[None, :] * stride_s_m
+    s = tl.load(s_ptrs, mask=k_mask[:, None] & m_mask[None, :])
 
     # Load qzeros: qzeros[group_id, off_m // 8]
-    z_m8_off = off_m // 8                                                         # [BLOCK_M]
-    z_ptrs = qzeros_ptr + group_ids[None, :] * stride_qz_g + z_m8_off[:, None] * stride_qz_m8
-    z_packed = tl.load(z_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0)  # [BLOCK_M, BLOCK_K]
+    z_m8 = off_m // 8                                          # [BLOCK_M]
+    z_ptrs = qzeros_ptr + group_id[:, None] * stride_qz_g + z_m8[None, :] * stride_qz_m8
+    z_packed = tl.load(z_ptrs, mask=k_mask[:, None] & m_mask[None, :], other=0)
 
-    # Unpack zero points: slot = off_m % 8
-    z_slot = off_m % 8                                              # [BLOCK_M]
-    z_shift = tl.where(z_slot == 0, 0,
-              tl.where(z_slot == 1, 16,
-              tl.where(z_slot == 2, 4,
-              tl.where(z_slot == 3, 20,
-              tl.where(z_slot == 4, 8,
-              tl.where(z_slot == 5, 24,
-              tl.where(z_slot == 6, 12, 28)))))))                  # [BLOCK_M]
-    z_val = (z_packed >> z_shift[:, None]) & 0xF                   # [BLOCK_M, BLOCK_K]
+    # Unpack zeros: slot = off_m % 8
+    z_shift = tl.where(off_m % 8 == 0, 0,
+               tl.where(off_m % 8 == 1, 16,
+               tl.where(off_m % 8 == 2, 4,
+               tl.where(off_m % 8 == 3, 20,
+               tl.where(off_m % 8 == 4, 8,
+               tl.where(off_m % 8 == 5, 24,
+               tl.where(off_m % 8 == 6, 12, 28)))))))
+    z_val = (z_packed >> z_shift[None, :]) & 0xF               # [BLOCK_K, BLOCK_M]
 
     # Dequantize
-    weight_fp16 = (int4_val.to(tl.float16) - z_val.to(tl.float16)) * s
+    w_fp16 = (w_int4.to(tl.float16) - z_val.to(tl.float16)) * s
 
-    # Store
-    out_ptrs = output_ptr + off_m[:, None] * stride_out_m + off_k[None, :] * stride_out_k
-    tl.store(out_ptrs, weight_fp16, mask=m_mask[:, None] & k_mask[None, :])
+    # Store output [K, M]
+    out_ptrs = output_ptr + off_k[:, None] * stride_out_k + off_m[None, :] * stride_out_m
+    tl.store(out_ptrs, w_fp16, mask=k_mask[:, None] & m_mask[None, :])
 
 
 def triton_awq_dequantize(qweight, scales, qzeros, group_size=128):
     """Triton-accelerated AWQ dequantize.
 
+    qweight: int32[K, M//8] → output fp16[K, M]
     Same interface as awq_dequantize().
     """
-    M, K8 = qweight.shape
-    K = K8 * 8
+    K, M8 = qweight.shape
+    M = M8 * 8
     num_groups = K // group_size
-    output = torch.empty(M, K, dtype=scales.dtype, device=qweight.device)
+    output = torch.empty(K, M, dtype=scales.dtype, device=qweight.device)
 
-    # Block sizes
-    BLOCK_M = 64
-    BLOCK_K = 128
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
+    BLOCK_K = 64
+    BLOCK_M = 128
+    grid = (triton.cdiv(K, BLOCK_K), triton.cdiv(M, BLOCK_M))
 
     _awq_dequantize_kernel[grid](
         qweight, scales, qzeros, output,
-        M, K, num_groups, group_size,
+        K, M, num_groups, group_size,
         qweight.stride(0), qweight.stride(1),
         scales.stride(0), scales.stride(1),
         qzeros.stride(0), qzeros.stride(1),
         output.stride(0), output.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
+        BLOCK_K=BLOCK_K, BLOCK_M=BLOCK_M,
     )
     return output

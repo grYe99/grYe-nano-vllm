@@ -43,10 +43,14 @@ class _AWQBase(nn.Module):
 class AWQColumnParallelLinear(_AWQBase, nn.Module):
     """Column-parallel AWQ linear: splits output dim across TP ranks.
 
-    Parameters loaded from checkpoint (TP-sharded during loading):
-        qweight: int32 [out_features // tp_size, in_features // 8]
-        qzeros:  int32 [num_groups, out_features // tp_size // 8]
-        scales:  fp16  [num_groups, out_features // tp_size]
+    AWQ qweight convention: qweight[in_features, out_features // 8]
+    Packed along the output dimension — 8 consecutive int4 values
+    along the output dim are packed into one int32.
+
+    Parameters (TP-sharded along the output dimension):
+        qweight: int32 [in_features, out_features_per_rank // 8]
+        qzeros:  int32 [num_groups, out_features_per_rank // 8]
+        scales:  fp16  [num_groups, out_features_per_rank]
     """
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False,
@@ -58,8 +62,9 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
         self.num_groups = input_size // group_size
         output_size_per_rank = divide(output_size, self.tp_size)
 
+        # qweight: [in_features, out_features_per_rank // 8]
         self.qweight = nn.Parameter(
-            torch.empty(output_size_per_rank, input_size // PACK_FACTOR, dtype=torch.int32),
+            torch.empty(input_size, output_size_per_rank // PACK_FACTOR, dtype=torch.int32),
             requires_grad=False)
         self.qzeros = nn.Parameter(
             torch.empty(self.num_groups, output_size_per_rank // PACK_FACTOR, dtype=torch.int32),
@@ -81,15 +86,15 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       loaded_shard_id: int | str | None = None):
         if param is self.qweight:
-            # loaded_weight shape: [out_features, in_features // 8]
-            # shard on dim 0 (output dim)
-            self._shard_on_dim(param.data, loaded_weight, 0, self.tp_rank, self.tp_size)
+            # loaded_weight: [in_features, out_features // 8]
+            # shard on dim 1 (packed output dim)
+            self._shard_on_dim(param.data, loaded_weight, 1, self.tp_rank, self.tp_size)
         elif param is self.qzeros:
-            # loaded_weight shape: [num_groups, out_features // 8]
+            # loaded_weight: [num_groups, out_features // 8]
             # shard on dim 1 (packed output dim)
             self._shard_on_dim(param.data, loaded_weight, 1, self.tp_rank, self.tp_size)
         elif param is self.scales:
-            # loaded_weight shape: [num_groups, out_features]
+            # loaded_weight: [num_groups, out_features]
             # shard on dim 1 (output dim)
             self._shard_on_dim(param.data, loaded_weight, 1, self.tp_rank, self.tp_size)
         elif param is self.bias:
@@ -98,17 +103,23 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
             raise ValueError(f"Unknown parameter: {param.shape}")
 
     def _dequantize_weight(self) -> torch.Tensor:
+        # Returns: [in_features, out_features_per_rank]
         return awq_dequantize(self.qweight, self.scales, self.qzeros, self.group_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [M, in_features]
+        # weight (dequantized): [in_features, out_features_per_rank], fp16
+        # Match input dtype (model may run in bf16)
         weight = self._dequantize_weight()
+        weight = weight.t().to(x.dtype)
         return F.linear(x, weight, self.bias)
 
 
 class AWQMergedColumnParallelLinear(AWQColumnParallelLinear):
     """Merged column-parallel AWQ linear (e.g. gate_proj + up_proj).
 
-    output_sizes: list of output dimensions for each sub-module.
+    Checkpoint has separate qweight/qzeros/scales for each sub-module.
+    They are concatenated along the **output** dimension (dim 1 of qweight).
     weight_loader uses loaded_shard_id (int) to place each sub-module slice.
     """
 
@@ -120,31 +131,31 @@ class AWQMergedColumnParallelLinear(AWQColumnParallelLinear):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       loaded_shard_id: int):
         """loaded_shard_id: index into output_sizes (0 for gate, 1 for up)."""
+        # Number of output elements this sub-module occupies per TP rank
+        out_size_per_rank = self.output_sizes[loaded_shard_id] // self.tp_size
+        out_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
+
         if param is self.qweight:
-            # Sub-module portion in the packed output rows
-            offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-            size = self.output_sizes[loaded_shard_id] // self.tp_size
-            shard = loaded_weight.chunk(self.tp_size, 0)[self.tp_rank]
-            target = param.data.narrow(0, offset, size)
-            target.copy_(shard)
+            offset = out_offset // PACK_FACTOR
+            size = out_size_per_rank // PACK_FACTOR
+            # loaded_weight: [in_features, out_size // 8]
+            shard = loaded_weight.chunk(self.tp_size, 1)[self.tp_rank]
+            param.data.narrow(1, offset, size).copy_(shard)
         elif param is self.qzeros:
-            offset = sum(self.output_sizes[:loaded_shard_id]) // PACK_FACTOR // self.tp_size
-            size = self.output_sizes[loaded_shard_id] // PACK_FACTOR // self.tp_size
+            offset = out_offset // PACK_FACTOR
+            size = out_size_per_rank // PACK_FACTOR
             shard = loaded_weight.chunk(self.tp_size, 1)[self.tp_rank]
-            target = param.data.narrow(1, offset, size)
-            target.copy_(shard)
+            param.data.narrow(1, offset, size).copy_(shard)
         elif param is self.scales:
-            offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-            size = self.output_sizes[loaded_shard_id] // self.tp_size
+            offset = out_offset
+            size = out_size_per_rank
             shard = loaded_weight.chunk(self.tp_size, 1)[self.tp_rank]
-            target = param.data.narrow(1, offset, size)
-            target.copy_(shard)
+            param.data.narrow(1, offset, size).copy_(shard)
         elif param is self.bias:
-            offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-            size = self.output_sizes[loaded_shard_id] // self.tp_size
+            offset = out_offset
+            size = out_size_per_rank
             shard = loaded_weight.chunk(self.tp_size, 0)[self.tp_rank]
-            target = param.data.narrow(0, offset, size)
-            target.copy_(shard)
+            param.data.narrow(0, offset, size).copy_(shard)
         else:
             raise ValueError(f"Unknown parameter: {param.shape}")
 
@@ -168,7 +179,11 @@ class AWQQKVParallelLinear(AWQColumnParallelLinear):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       loaded_shard_id: str):
-        """loaded_shard_id: "q", "k", or "v"."""
+        """loaded_shard_id: "q", "k", or "v".
+
+        For qweight: the packed output dimension is dim 1.
+        Each head group occupies (num_heads * head_size // 8) packed int32s.
+        """
         if loaded_shard_id == "q":
             shard_size = self.num_heads * self.head_size
             offset = 0
@@ -182,8 +197,9 @@ class AWQQKVParallelLinear(AWQColumnParallelLinear):
             raise ValueError(f"Unknown shard_id: {loaded_shard_id}")
 
         if param is self.qweight:
-            loaded_shard = loaded_weight.chunk(self.tp_size, 0)[self.tp_rank]
-            param.data.narrow(0, offset, shard_size).copy_(loaded_shard)
+            # loaded_weight: [hidden_size, total_out // 8], shard on dim 1
+            loaded_shard = loaded_weight.chunk(self.tp_size, 1)[self.tp_rank]
+            param.data.narrow(1, offset // PACK_FACTOR, shard_size // PACK_FACTOR).copy_(loaded_shard)
         elif param is self.qzeros:
             loaded_shard = loaded_weight.chunk(self.tp_size, 1)[self.tp_rank]
             param.data.narrow(1, offset // PACK_FACTOR, shard_size // PACK_FACTOR).copy_(loaded_shard)
@@ -200,8 +216,12 @@ class AWQQKVParallelLinear(AWQColumnParallelLinear):
 class AWQRowParallelLinear(_AWQBase, nn.Module):
     """Row-parallel AWQ linear: splits input dim across TP ranks.
 
+    AWQ qweight convention: qweight[in_features, out_features // 8].
+    Row-parallel splits the **input** dimension, so each rank gets
+    a slice of dim 0 of qweight.
+
     Parameters (TP-sharded along input dimension):
-        qweight: int32 [out_features, in_features // tp_size // 8]
+        qweight: int32 [in_features_per_rank, out_features // 8]
         qzeros:  int32 [num_groups_per_rank, out_features // 8]
         scales:  fp16  [num_groups_per_rank, out_features]
     """
@@ -216,8 +236,9 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
         input_size_per_rank = divide(input_size, self.tp_size)
         num_groups_per_rank = input_size_per_rank // group_size
 
+        # qweight: [in_features_per_rank, out_features // 8]
         self.qweight = nn.Parameter(
-            torch.empty(output_size, input_size_per_rank // PACK_FACTOR, dtype=torch.int32),
+            torch.empty(input_size_per_rank, output_size // PACK_FACTOR, dtype=torch.int32),
             requires_grad=False)
         self.qzeros = nn.Parameter(
             torch.empty(num_groups_per_rank, output_size // PACK_FACTOR, dtype=torch.int32),
@@ -239,12 +260,12 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       loaded_shard_id: int | str | None = None):
         if param is self.qweight:
-            # loaded_weight: [out_features, in_features // 8]
-            # shard on dim 1 (packed input dim)
-            self._shard_on_dim(param.data, loaded_weight, 1, self.tp_rank, self.tp_size)
+            # loaded_weight: [in_features, out_features // 8]
+            # shard on dim 0 (input dim)
+            self._shard_on_dim(param.data, loaded_weight, 0, self.tp_rank, self.tp_size)
         elif param is self.qzeros:
             # loaded_weight: [num_groups, out_features // 8]
-            # shard on dim 0 (groups)
+            # shard on dim 0 (groups = in_features // group_size)
             self._shard_on_dim(param.data, loaded_weight, 0, self.tp_rank, self.tp_size)
         elif param is self.scales:
             # loaded_weight: [num_groups, out_features]
@@ -256,11 +277,17 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
             raise ValueError(f"Unknown parameter: {param.shape}")
 
     def _dequantize_weight(self) -> torch.Tensor:
+        # Returns: [in_features_per_rank, out_features]
         return awq_dequantize(self.qweight, self.scales, self.qzeros, self.group_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weight = self._dequantize_weight()
-        y = F.linear(x, weight, self.bias if self.tp_rank == 0 else None)
+        # x: [M, in_features] — need to slice input for this rank
+        x_shard = x.narrow(-1, self.tp_rank * (x.size(-1) // self.tp_size),
+                           x.size(-1) // self.tp_size)
+        # weight (dequantized): [in_features_per_rank, out_features], fp16
+        # Match input dtype and transpose for F.linear
+        weight = self._dequantize_weight().t().to(x.dtype)
+        y = F.linear(x_shard, weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y
