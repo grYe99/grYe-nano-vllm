@@ -161,3 +161,186 @@ def triton_awq_dequantize(qweight, scales, qzeros, group_size=128):
         BLOCK_K=BLOCK_K, BLOCK_M=BLOCK_M,
     )
     return output
+
+
+# ---------------------------------------------------------------------------
+# Fused AWQ GEMM: activation @ (dequantize(qweight, scales, qzeros))
+# Ported from vllm: uses tl.interleave for packed-dim expansion and
+# interleaved split-K for better load balancing.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _awq_gemm_kernel(
+    a_ptr, b_ptr, scales_ptr, zeros_ptr, c_ptr,
+    M, N, K, group_size,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr, SPLIT_K: tl.constexpr,
+):
+    """Fused AWQ GEMM Triton kernel.
+
+    C[M, N] = A[M, K] @ dequantize(B[K, N//8], scales, zeros)
+    with split-K parallelism (SPLIT_K partitions along K).
+
+    C is stored as a 3D partial-sum buffer (SPLIT_K, M, N).
+    """
+    pid = tl.program_id(0)
+    pid_z = tl.program_id(1)
+
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    accumulator_dtype = c_ptr.type.element_ty
+
+    # Precompute AWQ reverse-order shifts for unpacking.
+    # AWQ stores 8 int4 values per int32 in slot order [0, 4, 1, 5, 2, 6, 3, 7].
+    # Shift amounts = slot * 4.
+    reverse_awq_order = ((tl.arange(0, 2) * 4)[None, :] + tl.arange(0, 4)[:, None]).reshape(8)
+    shifts = reverse_awq_order * 4
+    shifts = tl.broadcast_to(shifts[None, :], (BLOCK_SIZE_K * (BLOCK_SIZE_N // 8), 8))
+    shifts = tl.reshape(shifts, (BLOCK_SIZE_K, BLOCK_SIZE_N))
+
+    # M, N offsets
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * (BLOCK_SIZE_N // 8) + tl.arange(0, BLOCK_SIZE_N // 8)
+    offs_zn = pid_n * (BLOCK_SIZE_N // 8) + tl.arange(0, BLOCK_SIZE_N // 8)
+    offs_sn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    masks_am = offs_am < M
+    masks_bn = offs_bn < N // 8
+    masks_zn = offs_zn < N // 8
+    masks_sn = offs_sn < N
+
+    # K offsets for this split-K partition (interleaved)
+    offs_k = pid_z * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
+    # Pointer setup
+    a_ptrs = a_ptr + K * offs_am[:, None] + offs_k[None, :]
+    b_ptrs = b_ptr + (N // 8) * offs_k[:, None] + offs_bn[None, :]
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)):
+        masks_k = offs_k < K
+        masks_a = masks_am[:, None] & masks_k[None, :]
+        a = tl.load(a_ptrs, mask=masks_a, other=0.0)
+
+        masks_b = masks_k[:, None] & masks_bn[None, :]
+        b = tl.load(b_ptrs, mask=masks_b, other=0)
+        # Expand packed dim: [BLOCK_K, BLOCK_N//8] → [BLOCK_K, BLOCK_N]
+        b = tl.interleave(b, b)
+        b = tl.interleave(b, b)
+        b = tl.interleave(b, b)
+
+        # Group index for this K tile (all K in a block belong to same group
+        # since BLOCK_SIZE_K=32 < group_size=128).
+        szk = (BLOCK_SIZE_K * SPLIT_K * k + pid_z * BLOCK_SIZE_K) // group_size
+        offs_szk = szk + tl.arange(0, 1)
+
+        # Load zeros
+        offs_z = (N // 8) * offs_szk[:, None] + offs_zn[None, :]
+        masks_zk = offs_szk < K // group_size
+        masks_z = masks_zk[:, None] & masks_zn[None, :]
+        zeros = tl.load(zeros_ptr + offs_z, mask=masks_z, other=0)
+        zeros = tl.interleave(zeros, zeros)
+        zeros = tl.interleave(zeros, zeros)
+        zeros = tl.interleave(zeros, zeros)
+        zeros = tl.broadcast_to(zeros, (BLOCK_SIZE_K, BLOCK_SIZE_N))
+
+        # Load scales
+        offs_s = N * offs_szk[:, None] + offs_sn[None, :]
+        masks_sk = offs_szk < K // group_size
+        masks_s = masks_sk[:, None] & masks_sn[None, :]
+        scales = tl.load(scales_ptr + offs_s, mask=masks_s, other=0.0)
+        scales = tl.broadcast_to(scales, (BLOCK_SIZE_K, BLOCK_SIZE_N))
+
+        # Dequantize
+        b = (b >> shifts) & 0xF
+        zeros = (zeros >> shifts) & 0xF
+        b = (b - zeros) * scales
+        b = b.to(c_ptr.type.element_ty)
+
+        # Accumulate
+        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
+
+        offs_k += BLOCK_SIZE_K * SPLIT_K
+        a_ptrs += BLOCK_SIZE_K * SPLIT_K
+        b_ptrs += BLOCK_SIZE_K * SPLIT_K * (N // 8)
+
+    c = accumulator.to(c_ptr.type.element_ty)
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + pid_z * N * M + N * offs_cm[:, None] + offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def awq_gemm_triton(
+    activations: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int = 128,
+    split_k_iters: int = 8,
+) -> torch.Tensor:
+    """Fused AWQ GEMM: activation @ dequantize(qweight, scales, qzeros).
+
+    This avoids materializing the full weight matrix, saving bandwidth
+    especially for small-batch (decode) scenarios.
+
+    Ported from vllm's awq_gemm_triton with identical kernel logic.
+
+    Args:
+        activations: fp16/bf16[M, K] — input activations.
+        qweight:  int32[K, N // 8] — packed 4-bit weights.
+        scales:   fp16[K // G, N] — per-group per-output scales.
+        qzeros:   int32[K // G, N // 8] — packed zero points.
+        group_size: AWQ group size (default 128).
+        split_k_iters: Number of K-partitions for split-K (default 8).
+                       Must be a power of 2 and <= 32.
+
+    Returns:
+        Tensor of same dtype as input with shape [M, N].
+    """
+    M, K = activations.shape
+    N = qweight.shape[1] * 8
+
+    assert split_k_iters & (split_k_iters - 1) == 0, \
+        f"split_k_iters must be power of 2, got {split_k_iters}"
+    assert group_size <= K
+    assert scales.shape[0] == K // group_size
+    assert qzeros.shape[0] == K // group_size
+
+    # Cast activations to fp16 if needed (AWQ weights are fp16, and tl.dot
+    # requires both operands to have the same dtype).  Preserve original
+    # dtype to cast the output back.
+    orig_dtype = activations.dtype
+    if activations.dtype != torch.float16:
+        activations = activations.to(torch.float16)
+
+    BLOCK_SIZE_M = 32
+    BLOCK_SIZE_N = 32
+    BLOCK_SIZE_K = 32
+
+    grid = (
+        triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
+        split_k_iters,
+    )
+
+    # 3D partial-result buffer for split-K reduction
+    result = torch.zeros(
+        (split_k_iters, M, N), dtype=torch.float16, device=activations.device,
+    )
+
+    _awq_gemm_kernel[grid](
+        activations, qweight, scales, qzeros, result,
+        M, N, K, group_size,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        SPLIT_K=split_k_iters,
+    )
+
+    result = result.sum(0)
+    if orig_dtype != torch.float16:
+        result = result.to(orig_dtype)
+    return result
