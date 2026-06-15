@@ -310,7 +310,7 @@ def awq_gemm_triton(
     assert scales.shape[0] == K // group_size
     assert qzeros.shape[0] == K // group_size
 
-    # Cast activations to fp16 if needed (AWQ weights are fp16, and tl.dot
+    # Cast activations from bf16 to fp16 if needed (AWQ weights are fp16, and tl.dot
     # requires both operands to have the same dtype).  Preserve original
     # dtype to cast the output back.
     orig_dtype = activations.dtype
