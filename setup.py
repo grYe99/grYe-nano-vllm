@@ -5,7 +5,8 @@ setup(
     ext_modules=[
         CUDAExtension(
             "nanovllm._C",
-            ["nanovllm/csrc/awq/gemm_kernels.cu"],
+            ["nanovllm/csrc/awq/gemm_kernels.cu",
+             "nanovllm/csrc/awq/torch_bindings.cpp"],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": [

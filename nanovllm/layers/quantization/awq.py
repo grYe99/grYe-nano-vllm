@@ -10,6 +10,9 @@ from nanovllm.layers.quantization.awq_triton import awq_dequantize, awq_gemm_tri
 GROUP_SIZE = 128
 PACK_FACTOR = 8  # 32 bits / 4 bits
 
+# AWQ pack order: reverse order maps [0,4,1,5,2,6,3,7] → [0,1,2,3,4,5,6,7]
+AWQ_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -23,6 +26,17 @@ def _attach_weight_loader(param, loader_fn):
 
 class _AWQBase(nn.Module):
     """Mixin-like base with helpers for AWQ weight loaders."""
+
+    def __init__(self):
+        super().__init__()
+        # Pre-compute AWQ order tensor as a buffer so it's not created during
+        # CUDA Graph capture (torch.tensor(..., device='cuda') is not
+        # permitted when a stream is capturing).
+        self.register_buffer(
+            "_awq_order",
+            torch.tensor(AWQ_ORDER, dtype=torch.int32),
+            persistent=False,
+        )
 
     @staticmethod
     def _shard_on_dim(param_data, loaded_weight, dim, tp_rank, tp_size):
@@ -104,13 +118,24 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
 
     def _dequantize_weight(self) -> torch.Tensor:
         # Returns: [in_features, out_features_per_rank]
-        return awq_dequantize(self.qweight, self.scales, self.qzeros, self.group_size)
+        return awq_dequantize(self.qweight, self.scales, self.qzeros,
+                              self.group_size, awq_order=self._awq_order)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [M, in_features]
         M = x.size(-2)
-        if M < 256:
-            # Small batch (decode phase): fused gemm avoids materializing
+        if M <= 16:
+            # Small decode: CUDA Tensor Core custom op (M <= 16 constraint)
+            orig_dtype = x.dtype
+            if x.dtype != torch.float16:
+                x = x.to(torch.float16)
+            y = torch.ops.nanovllm.awq_gemm(
+                x, self.qweight, self.scales, self.qzeros, 8)
+            if orig_dtype != torch.float16:
+                y = y.to(orig_dtype)
+            return y
+        elif M < 256:
+            # Medium batch (decode phase): fused gemm avoids materializing
             # the full weight matrix, saving bandwidth.
             return awq_gemm_triton(x, self.qweight, self.scales, self.qzeros,
                                    self.group_size, split_k_iters=8)
@@ -284,7 +309,8 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
 
     def _dequantize_weight(self) -> torch.Tensor:
         # Returns: [in_features_per_rank, out_features]
-        return awq_dequantize(self.qweight, self.scales, self.qzeros, self.group_size)
+        return awq_dequantize(self.qweight, self.scales, self.qzeros,
+                              self.group_size, awq_order=self._awq_order)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [M, in_features] — need to slice input for this rank
@@ -292,8 +318,17 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
                            x.size(-1) // self.tp_size)
         M = x_shard.size(-2)
 
-        if M < 256:
-            # Small batch: fused gemm
+        if M <= 16:
+            # Small decode: CUDA Tensor Core custom op (M <= 16 constraint)
+            orig_dtype = x_shard.dtype
+            if x_shard.dtype != torch.float16:
+                x_shard = x_shard.to(torch.float16)
+            y = torch.ops.nanovllm.awq_gemm(
+                x_shard, self.qweight, self.scales, self.qzeros, 8)
+            if orig_dtype != torch.float16:
+                y = y.to(orig_dtype)
+        elif M < 256:
+            # Medium batch: fused gemm
             y = awq_gemm_triton(x_shard, self.qweight, self.scales, self.qzeros,
                                 self.group_size, split_k_iters=8)
         else:
