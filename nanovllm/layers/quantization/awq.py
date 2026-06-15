@@ -5,7 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanovllm.layers.quantization.awq_triton import awq_dequantize
+from nanovllm.layers.quantization.awq_triton import awq_dequantize, awq_gemm_triton
 
 GROUP_SIZE = 128
 PACK_FACTOR = 8  # 32 bits / 4 bits
@@ -108,8 +108,14 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [M, in_features]
-        # weight (dequantized): [in_features, out_features_per_rank], fp16
-        # Match input dtype (model may run in bf16)
+        M = x.size(-2)
+        if M < 256:
+            # Small batch (decode phase): fused gemm avoids materializing
+            # the full weight matrix, saving bandwidth.
+            return awq_gemm_triton(x, self.qweight, self.scales, self.qzeros,
+                                   self.group_size, split_k_iters=8)
+        # Large batch (prefill phase): cuBLAS GEMM is efficient enough that
+        # dequant overhead is well amortized.
         weight = self._dequantize_weight()
         weight = weight.t().to(x.dtype)
         return F.linear(x, weight, self.bias)
@@ -284,10 +290,16 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
         # x: [M, in_features] — need to slice input for this rank
         x_shard = x.narrow(-1, self.tp_rank * (x.size(-1) // self.tp_size),
                            x.size(-1) // self.tp_size)
-        # weight (dequantized): [in_features_per_rank, out_features], fp16
-        # Match input dtype and transpose for F.linear
-        weight = self._dequantize_weight().t().to(x.dtype)
-        y = F.linear(x_shard, weight, self.bias if self.tp_rank == 0 else None)
+        M = x_shard.size(-2)
+
+        if M < 256:
+            # Small batch: fused gemm
+            y = awq_gemm_triton(x_shard, self.qweight, self.scales, self.qzeros,
+                                self.group_size, split_k_iters=8)
+        else:
+            # Large batch: dequant + cuBLAS matmul
+            weight = self._dequantize_weight().t().to(x.dtype)
+            y = F.linear(x_shard, weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y
