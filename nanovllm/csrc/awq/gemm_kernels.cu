@@ -103,19 +103,10 @@ __global__ void __launch_bounds__(64)
       *(uint4*)(A_shared_ptr) = make_uint4(0, 0, 0, 0);
     }
 
-    // for (int ax0_ax1_fused_0 = 0; ax0_ax1_fused_0 < 2; ++ax0_ax1_fused_0) {
     uint32_t zeros_loaded = *(uint32_t*)(zeros_ptr + k_0_0 * 32 / G * (OC / 8));
     uint4 B_loaded_zero = dequantize_s4_to_fp16x2(zeros_loaded);
     uint4 B_loaded_scale =
         *(uint4*)(scaling_factors_ptr + k_0_0 * 32 / G * (OC));
-    /*
-    if (blockIdx_z == 0 && blockIdx_y == 0 && k_0_0 == 0 && threadIdx.x == 0 &&
-    threadIdx.y == 0){ printf("%x %x %x %x %x %x %x %x\n", B_loaded_scale.x,
-    B_loaded_scale.y, B_loaded_scale.z, B_loaded_scale.w, B_loaded_zero.x,
-    B_loaded_zero.y, B_loaded_zero.z, B_loaded_zero.w);
-    }
-    */
-    // uint4 B_loaded_scale = make_uint4(0, 0, 0, 0);
     int* B_ptr_local = B_ptr + k_0_0 * 32 * (OC / 8);
 
     for (int ax0_ax1_fused_0 = 0; ax0_ax1_fused_0 < N / 16; ++ax0_ax1_fused_0) {
@@ -160,13 +151,6 @@ __global__ void __launch_bounds__(64)
       asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
                    : "=r"(B_loaded_fp16.w)
                    : "r"(B_loaded_fp16.w), "r"(B_loaded_scale.w), "r"(ZERO));
-      /*
-      if (ax0_ax1_fused_0 == 0 && blockIdx_z == 0 && blockIdx_y == 0 && k_0_0 ==
-      0 && threadIdx.x == 17 && threadIdx.y == 0){ printf("[x] %X %X %X %X\n",
-      B_loaded_fp16.x, B_loaded_fp16.y, B_loaded_fp16.z, B_loaded_fp16.w);
-      }
-      */
-
       // write back
       *(uint4*)(B_shared_ptr + ax0_ax1_fused_0 * row_stride * (N + 8)) =
           B_loaded_fp16;
@@ -336,7 +320,7 @@ torch::Tensor awq_gemm(torch::Tensor _in_feats,
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
   if (num_out_channels % 128 == 0) {
-    int j_factors1 = num_out_channels / 128 / 1;
+    int j_factors1 = num_out_channels / 128;
     dim3 num_blocks((num_in_feats + 16 - 1) / 16 * j_factors1 * split_k_iters);
     dim3 threads_per_block(32, 2);
     nanovllm::awq::gemm_forward_4bit_cuda_m16nXk32<128>
@@ -345,8 +329,8 @@ torch::Tensor awq_gemm(torch::Tensor _in_feats,
             num_in_feats, num_in_channels, num_out_channels, out_feats);
   } else {
     // num_out_channels % 64 == 0 case
-    int j_factors1 = num_out_channels / 64 / 1;
-    dim3 num_blocks(1 * (num_in_feats + 16 - 1) / 16 * j_factors1 *
+    int j_factors1 = num_out_channels / 64;
+    dim3 num_blocks((num_in_feats + 16 - 1) / 16 * j_factors1 *
                     split_k_iters);
     dim3 threads_per_block(32, 2);
     nanovllm::awq::gemm_forward_4bit_cuda_m16nXk32<64>
@@ -357,20 +341,4 @@ torch::Tensor awq_gemm(torch::Tensor _in_feats,
 
   // Sum over split_k_iters dimension
   return _out_feats.sum(0);
-}
-
-// TORCH_LIBRARY registration
-TORCH_LIBRARY(nanovllm, m) {
-    m.def("awq_gemm(Tensor in_feats, Tensor kernel, "
-           "Tensor scaling_factors, Tensor zeros, "
-           "int split_k_iters) -> Tensor");
-}
-
-TORCH_LIBRARY_IMPL(nanovllm, CUDA, m) {
-    m.impl("awq_gemm", &awq_gemm);
-}
-
-// Define the Python module so the extension is importable.
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("awq_gemm", &awq_gemm, "AWQ quantized GEMM forward");
 }

@@ -26,13 +26,18 @@ AWQ_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
 AWQ_SHIFTS = [s * 4 for s in AWQ_ORDER]  # [0, 16, 4, 20, 8, 24, 12, 28]
 
 
+@torch.compile
 def awq_dequantize(qweight: torch.Tensor, scales: torch.Tensor,
-                   qzeros: torch.Tensor, group_size: int = 128) -> torch.Tensor:
+                   qzeros: torch.Tensor, group_size: int = 128,
+                   awq_order: torch.Tensor | None = None) -> torch.Tensor:
     """Pure-PyTorch AWQ dequantize — reference implementation.
 
     qweight: int32[K, M//8] (K=in_features, M=out_features)
     scales:  fp16[num_groups, M]
     qzeros:  int32[num_groups, M//8]
+
+    awq_order: optional pre-computed order tensor on the correct device.
+               If None, created on the fly (not CUDA Graph safe).
 
     Returns fp16 weight of shape [K, M] = [in_features, out_features].
     """
@@ -41,7 +46,10 @@ def awq_dequantize(qweight: torch.Tensor, scales: torch.Tensor,
     num_groups = K // group_size
     G = num_groups
 
-    order = torch.tensor(AWQ_ORDER, device=qweight.device)
+    if awq_order is not None:
+        order = awq_order
+    else:
+        order = torch.tensor(AWQ_ORDER, device=qweight.device)
 
     # Unpack qweight: [K, M/8] with each int32 containing 8 int4 values
     # Expand: [K, M/8] → [K, M/8, 8], then shift and mask, then reshape
