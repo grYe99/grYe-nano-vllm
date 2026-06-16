@@ -34,9 +34,6 @@ __global__ void __launch_bounds__(64)
   __shared__ half A_shared[16 * (32 + 8)];
   __shared__ half B_shared[32 * (N + 8)];
 
-  int j_factors1 = ((OC + N - 1) / N);
-  int blockIdx_y = blockIdx.x % ((M + 16 - 1) / 16 * j_factors1);
-  int blockIdx_z = blockIdx.x / ((M + 16 - 1) / 16 * j_factors1);
 
   half A_shared_warp[8];
   half B_shared_warp[N / 4];
@@ -48,22 +45,22 @@ __global__ void __launch_bounds__(64)
 
   static constexpr int row_stride_warp = 32 * 8 / 32;
   static constexpr int row_stride = 2 * 32 * 8 / N;
-  // TODO: Haotian: blockIdx_y / j_factors1 in A loading to support bsz > 16
+  // TODO: Haotian: blockIdx.x in A loading to support bsz > 16
   bool ld_A_flag =
-      (blockIdx_y / j_factors1 * 16 + threadIdx.y * row_stride_warp +
+      (blockIdx.x * 16 + threadIdx.y * row_stride_warp +
        threadIdx.x * 8 / 32) < M;  // threadIdx.y is warp_id
   // bool wb_C_flag = (threadIdx.x / 4) < M;
 
   half* A_ptr =
       A +
-      (((int)blockIdx_y) / j_factors1 * 16 +
-       (((int)threadIdx.y) * row_stride_warp) + ((int)threadIdx.x) / (32 / 8)) *
-          IC +
+      ((int)blockIdx.x * 16 +
+       ((int)threadIdx.y) * row_stride_warp +
+       ((int)threadIdx.x) / (32 / 8)) * IC +
       (((int)threadIdx.x) % (32 / 8)) * 8;
 
   int* B_ptr = B + ((int)threadIdx.y) * (OC / 8) * (256 / N) +
                (((int)threadIdx.x) / (N / 8)) * (OC / 8) +
-               (((int)blockIdx_y) % j_factors1) * (N / 8) +
+               (int)blockIdx.y * (N / 8) +
                (((int)threadIdx.x) % (N / 8)) * 1;
   // Why * 1 in the above line?
 
@@ -77,26 +74,26 @@ __global__ void __launch_bounds__(64)
                        (((int)threadIdx.x) / (N / 8)) * (N + 8) +
                        (((int)threadIdx.x) % (N / 8)) * 8;
 
-  int* zeros_ptr = zeros + (((int)blockIdx_y) % j_factors1) * (N / 8) +
+  int* zeros_ptr = zeros + (int)blockIdx.y * (N / 8) +
                    ((int)threadIdx.x) % (N / 8);
 
   half* scaling_factors_ptr = scaling_factors +
-                              (((int)blockIdx_y) % j_factors1) * N +
+                              (int)blockIdx.y * N +
                               (((int)threadIdx.x) % (N / 8)) * 8;
 
   half* C_ptr =
       C +
-      static_cast<long long>(blockIdx_z) * M * OC  // blockIdz.x -> split_k dim
-      + (((int)blockIdx_y) % j_factors1) * N + ((int)threadIdx.y) * (N / 2) +
+      static_cast<long long>(blockIdx.z) * M * OC  // blockIdz.x -> split_k dim
+      + (int)blockIdx.y * N + ((int)threadIdx.y) * (N / 2) +
       (((int)threadIdx.x) % 4) * 2;
 
   // preload s.f. and zeros
   int k_bound = (IC / 32 + split_k_iters - 1) / split_k_iters;
-  if ((k_bound - 1) * split_k_iters * 32 + blockIdx_z * 32 >= IC) k_bound -= 1;
+  if ((k_bound - 1) * split_k_iters * 32 + blockIdx.z * 32 >= IC) k_bound -= 1;
   for (int _k_0_0 = 0; _k_0_0 < k_bound; ++_k_0_0) {
-    int k_0_0 = _k_0_0 * split_k_iters + blockIdx_z;
+    int k_0_0 = _k_0_0 * split_k_iters + blockIdx.z;
     __syncthreads();
-    // TODO: Haotian: blockIdx_y / j_factors1 in A loading to support bsz > 16
+    // TODO: Haotian: blockIdx.x in A loading to support bsz > 16
     if (ld_A_flag) {
       *(uint4*)(A_shared_ptr) = *(uint4*)(A_ptr + (k_0_0 * 32));
     } else {
@@ -250,7 +247,7 @@ __global__ void __launch_bounds__(64)
   // TODO: Shang: Hoist loop invariance.
   for (int ax1_0_1 = 0; ax1_0_1 < (N / 32); ++ax1_0_1) {
     for (int local_id = 0; local_id < 8; ++local_id) {
-      int row_offset = (((int)blockIdx_y) / j_factors1) * 16 +
+      int row_offset = (int)blockIdx.x * 16 +
                        ((int)threadIdx.x) / 4 + (local_id % 4) / 2 * 8;
       if (row_offset < M) {
         *(C_ptr + ax1_0_1 * 16 + row_offset * OC + (local_id / 4) * 8 +
@@ -320,7 +317,7 @@ torch::Tensor awq_gemm(torch::Tensor _in_feats,
 
   if (num_out_channels % 128 == 0) {
     int j_factors1 = num_out_channels / 128;
-    dim3 num_blocks((num_in_feats + 16 - 1) / 16 * j_factors1 * split_k_iters);
+    dim3 num_blocks((num_in_feats + 16 - 1) / 16, j_factors1, split_k_iters);
     dim3 threads_per_block(32, 2);
     nanovllm::awq::gemm_forward_4bit_cuda_m16nXk32<128>
         <<<num_blocks, threads_per_block, 0, stream>>>(
@@ -328,9 +325,7 @@ torch::Tensor awq_gemm(torch::Tensor _in_feats,
             num_in_feats, num_in_channels, num_out_channels, out_feats);
   } else {
     // num_out_channels % 64 == 0 case
-    int j_factors1 = num_out_channels / 64;
-    dim3 num_blocks((num_in_feats + 16 - 1) / 16 * j_factors1 *
-                    split_k_iters);
+    dim3 num_blocks((num_in_feats + 16 - 1) / 16, num_out_channels / 64, split_k_iters);
     dim3 threads_per_block(32, 2);
     nanovllm::awq::gemm_forward_4bit_cuda_m16nXk32<64>
         <<<num_blocks, threads_per_block, 0, stream>>>(
