@@ -23,7 +23,7 @@
   #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
-#include "kernel.h"
+#include "marlin.cuh"
 #include "core/registration.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
@@ -254,10 +254,67 @@ MarlinFuncPtr get_marlin_kernel(
     int thread_m_blocks, int thread_n_blocks, int thread_k_blocks,
     bool m_block_size_8, bool has_act_order, bool has_zp, int group_blocks,
     int threads, bool is_zp_float, int stages) {
-  int num_bits = b_type.size_bits();
   auto kernel = MarlinDefault;
 
-  #include "kernel_selector.h"
+  // Only fp16×u4 kernels are compiled.
+  // Template params: threads, thread_m_blocks, thread_n_blocks, thread_k_blocks,
+  //                  m_block_size_8, stages(=4), group_blocks, is_zp_float(=false)
+  if (a_type == nanovllm::kFloat16 && b_type == nanovllm::kU4 &&
+      c_type == nanovllm::kFloat16 && s_type == nanovllm::kFloat16 &&
+      stages == 4 && !is_zp_float) {
+
+#define TRY_GB(TH, TM, TN, TK, M8)                                          \
+  if (threads == TH && thread_m_blocks == TM && thread_n_blocks == TN &&     \
+      thread_k_blocks == TK && m_block_size_8 == M8) {                      \
+    switch (group_blocks) {                                                  \
+      case -1:                                                               \
+        kernel = Marlin<nanovllm::kFloat16.id(), nanovllm::kU4.id(),        \
+                        nanovllm::kFloat16.id(), nanovllm::kFloat16.id(),   \
+                        TH, TM, TN, TK, M8, 4, -1, false>;                  \
+        break;                                                               \
+      case 2:                                                                \
+        kernel = Marlin<nanovllm::kFloat16.id(), nanovllm::kU4.id(),        \
+                        nanovllm::kFloat16.id(), nanovllm::kFloat16.id(),   \
+                        TH, TM, TN, TK, M8, 4, 2, false>;                   \
+        break;                                                               \
+      case 4:                                                                \
+        kernel = Marlin<nanovllm::kFloat16.id(), nanovllm::kU4.id(),        \
+                        nanovllm::kFloat16.id(), nanovllm::kFloat16.id(),   \
+                        TH, TM, TN, TK, M8, 4, 4, false>;                   \
+        break;                                                               \
+      case 8:                                                                \
+        kernel = Marlin<nanovllm::kFloat16.id(), nanovllm::kU4.id(),        \
+                        nanovllm::kFloat16.id(), nanovllm::kFloat16.id(),   \
+                        TH, TM, TN, TK, M8, 4, 8, false>;                   \
+        break;                                                               \
+    }                                                                        \
+  }
+
+    // thread_m_blocks=1 (small batch: m_block_size_8 true/false variants)
+    TRY_GB(256, 1, 8, 8, true);
+    TRY_GB(128, 1, 8, 4, true);
+    TRY_GB(128, 1, 4, 8, true);
+    TRY_GB(256, 1, 8, 8, false);
+    TRY_GB(128, 1, 8, 4, false);
+    TRY_GB(128, 1, 4, 8, false);
+
+    // thread_m_blocks=2 (large batch)
+    TRY_GB(256, 2, 16, 4, false);
+    TRY_GB(128, 2, 8, 4, false);
+    TRY_GB(128, 2, 4, 8, false);
+
+    // thread_m_blocks=3
+    TRY_GB(256, 3, 16, 4, false);
+    TRY_GB(128, 3, 8, 4, false);
+    TRY_GB(128, 3, 4, 8, false);
+
+    // thread_m_blocks=4
+    TRY_GB(256, 4, 16, 4, false);
+    TRY_GB(128, 4, 8, 4, false);
+    TRY_GB(128, 4, 4, 8, false);
+
+#undef TRY_GB
+  }
 
   return kernel;
 }
