@@ -45,11 +45,9 @@ __global__ void __launch_bounds__(64)
 
   static constexpr int row_stride_warp = 32 * 8 / 32;
   static constexpr int row_stride = 2 * 32 * 8 / N;
-  // TODO: Haotian: blockIdx.x in A loading to support bsz > 16
   bool ld_A_flag =
       (blockIdx.x * 16 + threadIdx.y * row_stride_warp +
        threadIdx.x * 8 / 32) < M;  // threadIdx.y is warp_id
-  // bool wb_C_flag = (threadIdx.x / 4) < M;
 
   half* A_ptr =
       A +
@@ -93,7 +91,6 @@ __global__ void __launch_bounds__(64)
   for (int _k_0_0 = 0; _k_0_0 < k_bound; ++_k_0_0) {
     int k_0_0 = _k_0_0 * split_k_iters + blockIdx.z;
     __syncthreads();
-    // TODO: Haotian: blockIdx.x in A loading to support bsz > 16
     if (ld_A_flag) {
       *(uint4*)(A_shared_ptr) = *(uint4*)(A_ptr + (k_0_0 * 32));
     } else {
@@ -121,9 +118,8 @@ __global__ void __launch_bounds__(64)
           *(uint32_t*)(B_ptr_local + ax0_ax1_fused_0 * row_stride * (OC / 8));
       uint4 B_loaded_fp16 = dequantize_s4_to_fp16x2(B_loaded);
 
-      // - zero and * scale
-      // TODO (Haotian): can save 4 assembly instructions if sormulate as deq =
-      // q * scale - zero * scale.
+      // (q - zero) * scale
+      // 此处可以优化为 q * scale - zero * scale， -zero*scale 可以预先计算好，存在寄存器里，减少一次乘法指令
       asm volatile("sub.f16x2 %0, %1, %2;\n"
                    : "=r"(B_loaded_fp16.x)
                    : "r"(B_loaded_fp16.x), "r"(B_loaded_zero.x));
@@ -156,6 +152,7 @@ __global__ void __launch_bounds__(64)
 
     for (int k_0_1 = 0; k_0_1 < 2; ++k_0_1) {
       {
+        // c++64位虚拟地址（GPU）转32位共享内存地址
         unsigned int addr;
         __asm__ __volatile__(
             "{ .reg .u64 addr; cvta.to.shared.u64 addr, %1; cvt.u32.u64 %0, "
