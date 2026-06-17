@@ -63,7 +63,7 @@ where `scale_factor * multiplier` can be computed at weight loading.
 
 */
 
-#include "marlin_dtypes.cuh"
+#include "marlin.cuh"
 
 namespace MARLIN_NAMESPACE_NAME {
 

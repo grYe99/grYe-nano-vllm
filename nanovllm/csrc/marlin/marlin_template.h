@@ -24,7 +24,6 @@
 #endif
 
 #include "marlin.cuh"
-#include "marlin_dtypes.cuh"
 #include "dequant.h"
 #include "marlin_mma.h"
 #include "core/scalar_type.hpp"
