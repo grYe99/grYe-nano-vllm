@@ -483,7 +483,7 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
             y = torch.ops.nanovllm.marlin_gemm(
                 x_shard, None, self.marlin_qweight,
                 self.bias if self.tp_rank == 0 else None,
-                self.scales, None, None, self.qzeros,  # original format
+                self.marlin_scales, None, None, self.marlin_qzeros,  # Marlin format
                 None, None, _workspace,
                 _MARLIN_KU4_ID,
                 x_shard.size(0), self.scales.size(1), x_shard.size(1),
