@@ -18,6 +18,7 @@ class Config:
     num_kvcache_blocks: int = -1
     kvcache_dtype: str = "auto"
     quant_method: str | None = None
+    awq_use_marlin: bool = True
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

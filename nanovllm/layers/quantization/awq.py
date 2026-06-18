@@ -7,15 +7,18 @@ import torch.distributed as dist
 
 from nanovllm.layers.quantization.awq_triton import awq_dequantize, awq_gemm_triton
 
-_USE_MARLIN = True  # Set False to use legacy AWQ CUDA kernel
+import nanovllm._C_marlin  # noqa: F401 — registers marlin ops under torch.ops.nanovllm
+# kU4 ScalarType ID: uint(4)=ScalarType(0,4,false,0,false,NAN_IEEE_754=1)
+# Packed: mantissa(4)<<8 | nan_repr(1)<<50 = 1125899906843648
+_MARLIN_KU4_ID = 1125899906843648
+_marlin_workspace: torch.Tensor | None = None
 
-if _USE_MARLIN:
-    import nanovllm._C_marlin  # noqa: F401 — registers marlin ops under torch.ops.nanovllm
-    _num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    _workspace = torch.zeros(_num_sms, dtype=torch.int32, device="cuda")
-    # kU4 ScalarType ID: uint(4)=ScalarType(0,4,false,0,false,NAN_IEEE_754=1)
-    # Packed: mantissa(4)<<8 | nan_repr(1)<<50 = 1125899906843648
-    _MARLIN_KU4_ID = 1125899906843648
+def _get_marlin_workspace() -> torch.Tensor:
+    global _marlin_workspace
+    if _marlin_workspace is None:
+        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+        _marlin_workspace = torch.zeros(num_sms, dtype=torch.int32, device="cuda")
+    return _marlin_workspace
 
 GROUP_SIZE = 128
 PACK_FACTOR = 8  # 32 bits / 4 bits
@@ -136,8 +139,9 @@ def _attach_weight_loader(param, loader_fn):
 class _AWQBase(nn.Module):
     """Mixin-like base with helpers for AWQ weight loaders."""
 
-    def __init__(self):
+    def __init__(self, use_marlin: bool = True):
         super().__init__()
+        self.use_marlin = use_marlin
         # Pre-compute AWQ order tensor as a buffer so it's not created during
         # CUDA Graph capture (torch.tensor(..., device='cuda') is not
         # permitted when a stream is capturing).
@@ -164,7 +168,7 @@ class _AWQBase(nn.Module):
 
     def _marlin_repack(self):
         """Repack qweight/qzeros/scales to Marlin format. Called after weight loading."""
-        if not _USE_MARLIN:
+        if not self.use_marlin:
             return
         if not hasattr(self, 'marlin_qweight'):
             return
@@ -201,8 +205,8 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
     """
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False,
-                 group_size: int = GROUP_SIZE):
-        super().__init__()
+                 group_size: int = GROUP_SIZE, use_marlin: bool = True):
+        super().__init__(use_marlin=use_marlin)
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.group_size = group_size
@@ -230,7 +234,7 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        if _USE_MARLIN:
+        if self.use_marlin:
             self.register_buffer("marlin_qweight", torch.empty(
                 input_size // 16, output_size_per_rank * 2, dtype=torch.int32))
             self.register_buffer("marlin_qzeros", torch.empty(
@@ -263,7 +267,7 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
                               self.group_size, awq_order=self._awq_order)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if _USE_MARLIN:
+        if self.use_marlin:
             orig_dtype = x.dtype
             if x.dtype != torch.float16:
                 x = x.to(torch.float16)
@@ -271,7 +275,7 @@ class AWQColumnParallelLinear(_AWQBase, nn.Module):
                 x, None, self.marlin_qweight,
                 self.bias, self.marlin_scales,
                 None, None, self.marlin_qzeros,  # Marlin format
-                None, None, _workspace,
+                None, None, _get_marlin_workspace(),
                 _MARLIN_KU4_ID,
                 x.size(0), self.scales.size(1), x.size(1),
                 True, False, False, False,
@@ -306,9 +310,10 @@ class AWQMergedColumnParallelLinear(AWQColumnParallelLinear):
     """
 
     def __init__(self, input_size: int, output_sizes: list[int],
-                 bias: bool = False, group_size: int = GROUP_SIZE):
+                 bias: bool = False, group_size: int = GROUP_SIZE,
+                 use_marlin: bool = True):
         self.output_sizes = output_sizes
-        super().__init__(input_size, sum(output_sizes), bias, group_size)
+        super().__init__(input_size, sum(output_sizes), bias, group_size, use_marlin=use_marlin)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       loaded_shard_id: int):
@@ -350,14 +355,15 @@ class AWQQKVParallelLinear(AWQColumnParallelLinear):
 
     def __init__(self, hidden_size: int, head_size: int,
                  total_num_heads: int, total_num_kv_heads: int | None = None,
-                 bias: bool = False, group_size: int = GROUP_SIZE):
+                 bias: bool = False, group_size: int = GROUP_SIZE,
+                 use_marlin: bool = True):
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
         self.num_kv_heads = divide(total_num_kv_heads, tp_size)
         output_size = (total_num_heads + 2 * total_num_kv_heads) * head_size
-        super().__init__(hidden_size, output_size, bias, group_size)
+        super().__init__(hidden_size, output_size, bias, group_size, use_marlin=use_marlin)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       loaded_shard_id: str):
@@ -409,8 +415,8 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
     """
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False,
-                 group_size: int = GROUP_SIZE):
-        super().__init__()
+                 group_size: int = GROUP_SIZE, use_marlin: bool = True):
+        super().__init__(use_marlin=use_marlin)
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.group_size = group_size
@@ -439,7 +445,7 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        if _USE_MARLIN:
+        if self.use_marlin:
             self.register_buffer("marlin_qweight", torch.empty(
                 input_size_per_rank // 16, output_size * 2, dtype=torch.int32))
             self.register_buffer("marlin_qzeros", torch.empty(
@@ -476,7 +482,7 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
         x_shard = x.narrow(-1, self.tp_rank * (x.size(-1) // self.tp_size),
                            x.size(-1) // self.tp_size)
 
-        if _USE_MARLIN:
+        if self.use_marlin:
             orig_dtype = x_shard.dtype
             if x_shard.dtype != torch.float16:
                 x_shard = x_shard.to(torch.float16)
@@ -484,7 +490,7 @@ class AWQRowParallelLinear(_AWQBase, nn.Module):
                 x_shard, None, self.marlin_qweight,
                 self.bias if self.tp_rank == 0 else None,
                 self.marlin_scales, None, None, self.marlin_qzeros,  # Marlin format
-                None, None, _workspace,
+                None, None, _get_marlin_workspace(),
                 _MARLIN_KU4_ID,
                 x_shard.size(0), self.scales.size(1), x_shard.size(1),
                 True, False, False, False,

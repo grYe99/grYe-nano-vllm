@@ -35,7 +35,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config, quant_method=config.quant_method)
+        self.model = Qwen3ForCausalLM(hf_config, quant_method=config.quant_method,
+                                      awq_use_marlin=config.awq_use_marlin)
         self.use_int8_kvcache = config.kvcache_dtype == "int8_per_token_head"
         load_model(self.model, config.model)
         self.sampler = Sampler()

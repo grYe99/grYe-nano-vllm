@@ -28,6 +28,7 @@ class Qwen3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
         quant_method: str | None = None,
+        use_marlin: bool = True,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -50,11 +51,13 @@ class Qwen3Attention(nn.Module):
                 self.total_num_heads,
                 self.total_num_kv_heads,
                 bias=qkv_bias,
+                use_marlin=use_marlin,
             )
             self.o_proj = AWQRowParallelLinear(
                 self.total_num_heads * self.head_dim,
                 hidden_size,
                 bias=False,
+                use_marlin=use_marlin,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -113,6 +116,7 @@ class Qwen3MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_method: str | None = None,
+        use_marlin: bool = True,
     ) -> None:
         super().__init__()
         if quant_method == "awq":
@@ -120,11 +124,13 @@ class Qwen3MLP(nn.Module):
                 hidden_size,
                 [intermediate_size] * 2,
                 bias=False,
+                use_marlin=use_marlin,
             )
             self.down_proj = AWQRowParallelLinear(
                 intermediate_size,
                 hidden_size,
                 bias=False,
+                use_marlin=use_marlin,
             )
         else:
             self.gate_up_proj = MergedColumnParallelLinear(
@@ -153,6 +159,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         config: Qwen3Config,
         quant_method: str | None = None,
+        use_marlin: bool = True,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -166,12 +173,14 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
             quant_method=quant_method,
+            use_marlin=use_marlin,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_method=quant_method,
+            use_marlin=use_marlin,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -198,10 +207,11 @@ class Qwen3Model(nn.Module):
         self,
         config: Qwen3Config,
         quant_method: str | None = None,
+        use_marlin: bool = True,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config, quant_method) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(config, quant_method, use_marlin) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -230,9 +240,10 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         config: Qwen3Config,
         quant_method: str | None = None,
+        awq_use_marlin: bool = True,
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config, quant_method)
+        self.model = Qwen3Model(config, quant_method, use_marlin=awq_use_marlin)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
