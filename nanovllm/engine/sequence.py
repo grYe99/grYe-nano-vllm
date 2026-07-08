@@ -31,6 +31,7 @@ class Sequence:
         self.arrival_time = perf_counter()
         self.first_token_time = 0.0
         self.completion_time = 0.0
+        self.token_times: list[float] = []  # per-step timestamps for ITL
 
     def __len__(self):
         return self.num_tokens
@@ -71,9 +72,11 @@ class Sequence:
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
+        now = perf_counter()
         if self.num_completion_tokens == 0:
-            self.first_token_time = perf_counter()
-        self.completion_time = perf_counter()
+            self.first_token_time = now
+        self.completion_time = now
+        self.token_times.append(now)
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1

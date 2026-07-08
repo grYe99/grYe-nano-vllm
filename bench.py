@@ -1,5 +1,6 @@
 import os
 import time
+import statistics
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
 # from vllm import LLM, SamplingParams
@@ -28,11 +29,39 @@ def main():
 
     ttfts = [o["ttft_ms"] for o in outputs]
     tpots = [o["tpot_ms"] for o in outputs]
-    avg_ttft = sum(ttfts) / len(ttfts)
-    avg_tpot = sum(tpots) / len(tpots)
-    print(f"Total: {total_tokens} tok, Time: {t:.2f}s, Throughput: {throughput:.2f} tok/s")
-    print(f"TTFT:  {avg_ttft:.1f} ms (avg)")
-    print(f"TPOT:  {avg_tpot:.2f} ms (avg)")
+    # Flatten all per-step ITLs from all requests
+    itls = [itl for o in outputs for itl in o["itl_ms"]]
+
+    avg_ttft = statistics.mean(ttfts) if ttfts else 0
+    med_ttft = statistics.median(ttfts) if ttfts else 0
+    p99_ttft = sorted(ttfts)[int(len(ttfts) * 0.99)] if ttfts else 0
+
+    avg_tpot = statistics.mean(tpots) if tpots else 0
+    med_tpot = statistics.median(tpots) if tpots else 0
+    p99_tpot = sorted(tpots)[int(len(tpots) * 0.99)] if tpots else 0
+
+    avg_itl = statistics.mean(itls) if itls else 0
+    med_itl = statistics.median(itls) if itls else 0
+    p99_itl = sorted(itls)[int(len(itls) * 0.99)] if itls else 0
+
+    print(f"============ Serving Benchmark Result ============")
+    print(f"Successful requests:                     {num_seqs}       ")
+    print(f"Benchmark duration (s):                  {t:.2f}     ")
+    print(f"Total generated tokens:                  {total_tokens}     ")
+    print(f"Output token throughput (tok/s):         {throughput:.2f}    ")
+    print(f"---------------Time to First Token----------------")
+    print(f"Mean TTFT (ms):                          {avg_ttft:.2f}  ")
+    print(f"Median TTFT (ms):                        {med_ttft:.2f}  ")
+    print(f"P99 TTFT (ms):                           {p99_ttft:.2f}  ")
+    print(f"-----Time per Output Token (excl. 1st token)------")
+    print(f"Mean TPOT (ms):                          {avg_tpot:.2f}  ")
+    print(f"Median TPOT (ms):                        {med_tpot:.2f}  ")
+    print(f"P99 TPOT (ms):                           {p99_tpot:.2f}  ")
+    print(f"---------------Inter-token Latency----------------")
+    print(f"Mean ITL (ms):                           {avg_itl:.2f}  ")
+    print(f"Median ITL (ms):                         {med_itl:.2f}  ")
+    print(f"P99 ITL (ms):                            {p99_itl:.2f}  ")
+    print(f"==================================================")
 
 
 if __name__ == "__main__":

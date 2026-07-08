@@ -109,12 +109,17 @@ class LLMEngine:
         results = []
         for seq, token_ids in zip(all_seqs, outputs):
             ttft = (seq.first_token_time - seq.arrival_time) * 1000  # ms
-            tpot = ((seq.completion_time - seq.first_token_time) / max(1, seq.num_completion_tokens)) * 1000  # ms
+            n = max(1, seq.num_completion_tokens)
+            tpot = ((seq.completion_time - seq.first_token_time) / n) * 1000  # ms
+            # ITL: per-step intervals between consecutive decode tokens
+            times = seq.token_times
+            itls = [(times[i] - times[i-1]) * 1000 for i in range(1, len(times))] if len(times) > 1 else []
             results.append({
                 "text": self.tokenizer.decode(token_ids),
                 "token_ids": token_ids,
                 "ttft_ms": ttft,
                 "tpot_ms": tpot,
+                "itl_ms": itls,
             })
         if use_tqdm:
             pbar.close()
