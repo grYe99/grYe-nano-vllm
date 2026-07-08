@@ -97,6 +97,11 @@ llm = LLM(path, enforce_eager=False, max_model_len=4096, kv_cache_dtype="int8_pe
 | baseline (fp16) | 856.37 tok/s | 62612.1 ms | 28.53 ms |
 | INT8 量化 | **1297.45 tok/s** (+51.5%) | **33724.1 ms** | 35.49 ms |
 
+> **吞吐提升的原因分析：**
+> - TTFT 下降 46%（62612 → 33724 ms）是 throughput 提升的主要驱动。Prefill 计算量在 fp16/INT8 下完全一致（INT8 只影响 KV cache 存储），TTFT 下降来自 **block 数量翻倍后的排队时间缩短** — 更多序列可一次性从 waiting 调度到 running，无需等待
+> - TPOT 上升（28.53 → 35.49 ms）是连续批处理下并发度增大的固有折衷：更多序列同时 decode → 每步耗时增加。INT8 反量化也带来少量额外开销（详见[此处](#关于小模型的说明)）
+> - 总体吞吐 856.37→1297.45 tok/s（+51.5%），说明 TTFT 缩短节省的时间远大于 TPOT 增加带来的开销
+
 > **TPOT 为什么上升？** 有两个因素共同作用：
 > 1. **KV Cache 内存减半 → 可分配的 Block 数量翻倍 → Scheduler 能容纳更多并发序列** → 每步 decode 处理更多序列 → 单步耗时增加。这是 Continuous Batching 下的固有现象：并发度增大时 TPOT 上升、TTFT 下降、总体吞吐提升（[TensorRT-LLM benchmark](https://meesho.github.io/BharatMLStack/blog/llm-inference-optimization-sub-sec-latency/) 同样显示并发 1→256 时 ITL 从 9ms 升至 59ms，吞吐提升 40×）
 > 2. **INT8 反量化开销** — 每次 Attention 读取 KV Cache 时需将 INT8 转回 FP16，增加少量计算
@@ -142,12 +147,11 @@ llm = LLM(path, enforce_eager=False, max_model_len=4096, awq_use_marlin=False)
 
 dispatch 策略：`M <= 512` 时 awq_gemm 更优，`M > 512` 时 dequant + cuBLAS 更优。
 
-#### 准确率 (GSM8K)
+> **吞吐提升的原因分析：**
+> - AWQ 将权重从 bf16 (~16GB) 压缩到 4bit (~5GB)，释放约 11GB 显存用于 KV Cache Block
+> - Block 数量大幅增长 → prefill 排队时间缩短 → TTFT 下降 60%（62132 → 24498 ms），是 throughput 提升的主要驱动
+> - Marlin Kernel 自身的 GEMM 加速也有贡献（详见下方 MicroBench）
 
-| 配置 | flexible-extract | strict-match |
-|:----:|:----------------:|:------------:|
-| baseline (hf) | 0.8832 | 0.8787 |
-| AWQ | ≈ baseline | ≈ baseline |
 
 > AWQ 是 weight-only 量化，对精度影响极小，实测与 hf baseline 无显著差异。
 
