@@ -67,9 +67,9 @@ def benchmark(fn, label, M):
 def main():
     qweight, scales, qzeros, marlin_qweight, marlin_qzeros, marlin_scales = create_awq_weights()
 
-    print(f"K={K}, N={N}, group_size={GROUP_SIZE}")
-    print(f"{'M':>6} | {'CUDA op':>10} | {'Triton':>12} | {'deq+cuB':>12} | {'Marlin':>12} | {'best':>8}")
-    print("-" * 70)
+    print(f"K={K}, N={N}, group_size={GROUP_SIZE}  (M = num_tokens)")
+    print(f"|{'M':>5} | {'awq_gemm':>8} | {'Triton':>8} | {'deq+cuB':>8} | {'Marlin':>8} | {'best':>8} |")
+    print(f"|{'-'*5}:|{'-'*8}:|{'-'*8}:|{'-'*8}:|{'-'*8}:|{'-'*8}|")
 
     for M in M_VALUES:
         act = torch.randn(M, K, dtype=torch.float16)
@@ -100,13 +100,9 @@ def main():
         t_marlin = benchmark(fn_marlin, "Marlin", M)
 
         # Determine best
-        times = {"CUDA": t_cuda, "Triton": t_triton, "deq+cuB": t_deq, "Marlin": t_marlin}
+        times = {"awq_gemm": t_cuda, "Triton": t_triton, "deq+cuB": t_deq, "Marlin": t_marlin}
         best_label = min(times, key=times.get)
-
-        def fmt(t):
-            return f"{t:>8.1f}" if t != float("inf") else f"{'N/A':>10}"
-
-        print(f"{M:>6} | {fmt(t_cuda)} | {fmt(t_triton)} | {fmt(t_deq)} | {fmt(t_marlin)} | {best_label:>8}")
+        print(f"|{M:>5} | {t_cuda:>8.1f} | {t_triton:>8.1f} | {t_deq:>8.1f} | {t_marlin:>8.1f} | {best_label:>8} |")
 
 
 if __name__ == "__main__":
